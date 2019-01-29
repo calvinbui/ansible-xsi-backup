@@ -12,7 +12,7 @@
 
 - name: Extract XSIBackup {{ xsibackup_version }} archive on target
   unarchive:
-    src: "XSIBACKUP-FREE-{{ xsibackup_version }}.zip"
+    src: "XSIBACKUP-FREE-{{ xsibackup_version }}.tar"
     dest: "{{ xsibackup_working_dir }}/xsibackup-{{ xsibackup_version }}"
     creates: "{{ xsibackup_working_dir }}/xsibackup-{{ xsibackup_version }}/xsibackup"
 
