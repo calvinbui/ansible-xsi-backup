@@ -2,3 +2,4 @@
 
 - name: Update crontab
   shell: "{{ xsibackup_working_dir }}/xsibackup/xsibackup --update-cron --exec=yes"
+  failed_when: "result.stderr != -9"
