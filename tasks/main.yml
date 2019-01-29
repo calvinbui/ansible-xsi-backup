@@ -66,4 +66,4 @@
   args:
     chdir: "{{ xsibackup_working_dir }}/xsibackup"
   register: result
-  changed_when: '"The root user crontab has been successfully installed" in result.stdout'
+  changed_when: "'successfully installed' in result.stdout"
