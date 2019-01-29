@@ -1,0 +1,79 @@
+#!/bin/sh
+
+getSha1Zero(){
+    if [ "$1" == "10485760" ]
+    then
+        echo "8c206a1a87599f532ce68675536f0b1546900d7a"
+    elif [ "$1" == "20971520" ]
+    then
+        echo "9674344c90c2f0646f0b78026e127c9b86e3ad77"
+    elif [ "$1" == "52428800" ]
+    then
+        echo "49886561f8e26ed5e2ae549897a28aaab44881bd"
+    fi
+}
+
+if [ "$2" != "" ]
+then
+    if [ "$( echo "$2" | awk '{print tolower($0)}' )" == "auto" ]
+    then
+        BLOCKSIZE=52428800
+    else
+        BADB=0
+        if [ "${#2}" -ne "3" ]
+        then
+            BADB=1
+        fi
+        if [ "${2:2:1}" != "M" ]
+        then
+            BADB=1
+        fi
+        BS="${2//M/}"
+        if [ "$BS" -ne "10" -a "$BS" -ne "20" -a "$BS" -ne "50" ]
+        then
+            BADB=1
+        fi
+        if [ "$BADB" == "1" ]
+        then
+            BLOCKSIZE=52428800
+        else
+            BLOCKSIZE=$(( $BS*1024*1024 ))
+        fi
+    fi
+else
+    BLOCKSIZE=52428800
+fi
+
+SHA1ZERO=$( getSha1Zero "$BLOCKSIZE" )
+
+if [ -f "$1" -a "$( echo ${1} | tail -c 6 )" == ".vmdk" ]
+then
+    DDBIN="dd"
+    OSBIN="openssl"
+    FILEPATH="$1"
+    FILENAME=$( basename "$2" )
+    FILESIZE=$( ls -las "$FILEPATH" | awk '{print $6}' )
+    DISKUSAG=$( du "$FILEPATH" | awk '{print $1}' )
+    DISKUSAG=$( python -c "print($DISKUSAG*1024)" )
+    BLKSUSED=$( python -c "print($DISKUSAG/$BLOCKSIZE)" )
+    PERCTFILL=$( python -c "print($DISKUSAG*100/$FILESIZE)" )
+    BLOCKCNT1=$( python -c "print($FILESIZE/$BLOCKSIZE)" )
+    BLOCKCNT2=$( python -c "print($FILESIZE/float($BLOCKSIZE))" )
+    if [ "$BLOCKCNT1" == "$BLOCKCNT2" ]
+    then
+        BLOCKCNT=$BLOCKCNT1
+    else
+        BLOCKCNT=$(( $BLOCKCNT1+1 ))
+    fi
+ 
+    TARGETFILE="${FILEPATH}.$$"	
+    bm=0
+    until [ $bm -eq $(( $BLOCKCNT )) ]
+    do
+    	HASH=$( "$DDBIN" if="$FILEPATH" bs=$BLOCKSIZE count=1 skip=$bm 2>/dev/null | "$OSBIN" sha1 2>/dev/null | grep "(stdin)=" | awk -F '=' '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' )
+	echo "$HASH" >> "$TARGETFILE"	 
+    bm=$(( $bm+1 ))
+    done
+else
+    echo "Not a .vmdk virtual disk"	
+fi

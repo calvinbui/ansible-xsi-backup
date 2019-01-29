@@ -1,0 +1,19 @@
+# This is a backup job file example. It starts with the path to your
+# xsibackup file and ends with the redirection to the log file. Please
+# do make sure that you keep first and last lines, changing paths to
+# match your working environment.
+
+"/vmfs/volumes/datastore1/xsi-dir/xsibackup" \
+--backup-prog=XSITools:z \
+--certify-backup=yes \
+--backup-point=/vmfs/volumes/backup/$( date +%Y%m'00000000' ) \
+--backup-type=Running \
+--backup-how=Hot \
+--remote-xsipath=/vmfs/volumes/datastore1/xsi-dir \
+--use-smtp=2 \
+--mail-to=daniel@33hops.com \
+--backup-id=001 \
+--description="XSITools backup of production VMs" \
+--on-success="backupId->002" \
+--on-error="backupId->002" \
+--exec=yes >> "/vmfs/volumes/datastore1/xsi-dir/var/logs/xsibackup.log"

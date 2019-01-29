@@ -1,0 +1,34 @@
+#!/bin/sh
+PWD="$( cd "$( dirname "$0" )" && cd .. && pwd )"
+
+if [ -f "$PWD/src/functions" ]
+then
+	. "$PWD/src/functions"
+fi
+
+if [ "$1" == "" ]
+then
+    cronuser="root"
+else
+    cronuser="$1"
+fi
+if [ ! -f "$PWD"/conf/${cronuser}-crontab ]
+then
+    touch "$PWD"/conf/${cronuser}-crontab	
+fi
+ADDCRON="$( cat "$PWD"/conf/${cronuser}-crontab | grep -v "^#" | sed '/^$/d' | sed 's/$/ # Added by XSIBackup/' )" && \
+if [ "${#ADDCRON}" -gt "0" ]
+then
+    sed -i '/Added by XSIBackup/d' /var/spool/cron/crontabs/${cronuser}
+    echo "$ADDCRON" >> /var/spool/cron/crontabs/${cronuser}
+    if [ "$?" -eq "0" ]
+    then
+    	echo "The ${cronuser} user crontab has been succesfully updated"
+    else
+    	echo "An error has accurred while trying to update the ${cronuser} user crontab"
+    fi
+else
+    echo "Nothing to add to the ${cronuser} crontab"
+fi
+
+crond_reinit

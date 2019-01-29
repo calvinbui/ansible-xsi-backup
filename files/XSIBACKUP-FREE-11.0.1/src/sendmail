@@ -1,0 +1,306 @@
+sendMail(){
+
+    HOSTNAME="$( getHostname )"
+   
+    if [ ! -f "$PWD"/xsibackup_id_rsa.pem ]
+    then 
+    	if [ -f "$PWD"/xsibackup_id_rsa ]
+    	then
+    	    /usr/lib/vmware/openssh/bin/ssh-keygen -f "$PWD"/xsibackup_id_rsa -m 'PEM' -e > "$PWD"/xsibackup_id_rsa.pem
+        fi
+    fi
+    
+    LOCAL_MAILTO="$1"
+    if [ "$LOCAL_MAILTO" == "" ]
+    then
+    	echo -e "Error: a --mail-to e-mail address is required"
+    fi
+    LOCAL_SUBJECT="$2"
+    if [ "$LOCAL_SUBJECT" == "" ]
+    then
+	echo -e "Error: a --subject is required"
+    fi	
+    LOCAL_CONTENT=$3
+    if [ "$LOCAL_CONTENT" == "" ]
+    then
+        echo -e "Error: HTML content is needed to send the e-mail"
+    fi	
+    LOCAL_USTATIC="$4"
+    if [ "$LOCAL_USTATIC" == "" ]
+    then
+	echo -e "Error: define static as 0 if parsing e-mail vars"
+    fi
+
+    if [ "$LOCAL_USTATIC" -eq "$LOCAL_USTATIC" -a "$LOCAL_USTATIC" -eq "0" ] 2>/dev/null
+    then
+	LOCAL_SMTPSRV="$5"
+	if [ "$LOCAL_SMTPSRV" == "" ]
+	then
+	    echo -e "Error: an --smtp-srv is required"
+	fi
+	LOCAL_SMTPPORT="$6"
+	if [ "$LOCAL_SMTPPORT" == "" ]
+	then
+    	    echo -e "Error: an --smtp-port is required"
+	fi	
+	LOCAL_MAILFROM="$7"
+	if [ "$LOCAL_MAILFROM" == "" ]
+	then
+	    echo -e "Error: a --mail-from address is required"
+	fi		
+	LOCAL_SMTPUSR="$8"
+	if [ "$LOCAL_SMTPUSR" == "" ]
+	then
+	    echo -e "Error: you must set an --smtp-usr"
+	fi	
+	LOCAL_SMTPPWD="$9"
+	if [ "$LOCAL_SMTPPWD" == "" ]
+	then
+	    echo -e "Error: you must set a password, use any if combined with --smtp-auth=none"
+	fi
+	LOCAL_SMTPAUTH="$10"
+	if [ "$LOCAL_SMTPAUTH" == "" ]
+	then
+	    LOCAL_SMTPAUTH="yes"
+	fi
+	LOCAL_SMTPSEC="$11"
+	if [ "$LOCAL_SMTPSEC" == "" ]
+	then
+	    LOCAL_SMTPSEC="none"
+	fi
+	LOCAL_DELAY="$12"
+	if [ "$LOCAL_DELAY" == "" ]
+	then
+	    LOCAL_DELAY="0"
+	fi
+    fi	
+    LOCAL_CONTENT="$( echo "${LOCAL_CONTENT}" | sed -e 's/\\r\\n//g' )"	
+    if [ "$LOCAL_USTATIC" -eq "$LOCAL_USTATIC" -a "$LOCAL_USTATIC" -gt "0" ] 2>/dev/null
+    then
+            echo -e "Using stored SMTP server info..."
+            if [ -f "$PWD"/conf/smtpsrvs ]
+            then
+                echo -e "Found conf/smtpsrvs file..."
+                smtps="$( cat "$PWD"/conf/smtpsrvs | grep -v '^#' | grep "^$LOCAL_USTATIC;" )"
+                
+                    LOCAL_SMTPSRVS="$( echo "$smtps" | awk -F ';' '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' | awk '{print tolower($0)}' )"
+                    LOCAL_SMTPPORT="$( echo "$LOCAL_SMTPSRVS" | awk -F ':' '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' )"
+                    LOCAL_SMTPSRV="$( echo "$LOCAL_SMTPSRVS" | awk -F ':' '{print $1}' | sed -e 's/^ *//g' -e 's/ *$//g' )"
+                    LOCAL_MAILFROM="$( echo "$smtps" | awk -F ';' '{print $3}' | sed -e 's/^ *//g' -e 's/ *$//g' | awk '{print tolower($0)}' )"
+                    LOCAL_SMTPUSR="$( echo "$smtps" | awk -F ';' '{print $4}' | sed -e 's/^ *//g' -e 's/ *$//g' | awk '{print tolower($0)}' )"
+                    LOCAL_SMTPPWD="$( echo "$smtps" | awk -F ';' '{print $5}' | sed -e 's/^ *//g' -e 's/ *$//g' )"
+                    LOCAL_SMTPAUTH="$( echo "$smtps" | awk -F ';' '{print $6}' | sed -e 's/^ *//g' -e 's/ *$//g' | awk '{print tolower($0)}')"
+                    LOCAL_SMTPSEC="$( echo "$smtps" | awk -F ';' '{print $7}' | sed -e 's/^ *//g' -e 's/ *$//g' | awk '{print tolower($0)}' )"
+		    LOCAL_DELAY="$( echo "$smtps" | awk -F ';' '{print $8}' | sed -e 's/^ *//g' -e 's/ *$//g' )"
+		    if [ -z "$LOCAL_DELAY" -o "$LOCAL_DELAY" == "" ]
+		    then
+			LOCAL_DELAY=0
+		    fi                    
+                if [ "$LOCAL_SMTPSRV" == "" -o "$LOCAL_SMTPPORT" == "" -o "$LOCAL_MAILFROM" == "" -o "$LOCAL_SMTPUSR" == "" -o "$LOCAL_SMTPPWD" == "" -o "$LOCAL_SMTPAUTH" == "" -o "$LOCAL_SMTPSEC" == "" ]
+                then
+                    echo -e "\033[0;31mError: cannot determine the e-mail server credentials, each smtpsrvs entry requires seven fields, please check syntax\033[0m"
+                    xsib_shutdown
+                fi
+            else
+                echo -e "\033[0;31mError: you set the argument --use-smtp, but you have not configured any servers in the config/smtpsrvs file\033[0m"
+                echo -e "Configure static entries for your SMTP servers in the config/smtpsrvs file or set each SMTP var in the backup job"
+                xsib_shutdown
+            fi
+    else
+        if [ "$LOCAL_SMTPSRV" == "" -o "$LOCAL_SMTPPORT" == "" -o "$LOCAL_MAILFROM" == "" -o "$LOCAL_SMTPUSR" == "" -o "$LOCAL_SMTPPWD" == "" -o "$LOCAL_SMTPAUTH" == "" -o "$LOCAL_SMTPSEC" == "" ]
+        then
+            echo -e "\033[0;31miError: cannot determine the e-mail server credentials\033[0m"
+            echo -e "Configure static entries for your SMTP servers in the config/smtpsrvs file or set each SMTP var in the backup job"
+            xsib_shutdown
+        fi
+    fi
+
+        IFS=","
+        em=0
+        for email in $LOCAL_MAILTO
+        do
+            if [ $(echo "${email}" | grep -E -o "\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,6}\b") ]
+            then
+                recipient="$email"
+                break
+            fi
+        em=$(( $em+1 ))
+        done
+	IFS=$OLDIFS
+            mail_input() {
+                if [ "${LOCAL_SMTPSRV//gmail/}" != "${LOCAL_SMTPSRV}" ]
+                then
+                    nl="\n"
+                    LOCAL_DELAY=2
+                    LOCAL_SMTPPORT="465"
+                else
+                    LOCAL_DELAY=$LOCAL_DELAY
+                    nl="\r\n"
+                fi
+                
+                sleep 2
+                echo -ne "helo ${HOSTNAME}${nl}"
+                 sleep ${LOCAL_DELAY}
+                echo -ne "ehlo ${HOSTNAME}${nl}"
+                 sleep ${LOCAL_DELAY}
+                if [ "$LOCAL_SMTPAUTH" != "none" ]
+                then
+                    echo -ne "AUTH LOGIN${nl}"
+                    sleep ${LOCAL_DELAY}
+                    if [ "${LOCAL_SMTPSRV//gmail/}" != "${LOCAL_SMTPSRV}" ]
+                    then
+                        echo -ne "$( echo $LOCAL_SMTPUSR | openssl base64 2>/dev/null )${nl}"
+                        sleep ${LOCAL_DELAY}
+                        echo -ne "$( echo $LOCAL_SMTPPWD | openssl base64 2>/dev/null )${nl}"
+                    else
+                        echo -ne "$( base64_encode $LOCAL_SMTPUSR )${nl}"
+                        sleep ${LOCAL_DELAY}
+                        echo -ne "$( base64_encode $LOCAL_SMTPPWD )${nl}"
+                    fi
+                    sleep ${LOCAL_DELAY}
+                fi
+                echo -ne "MAIL FROM: <${LOCAL_MAILFROM}>${nl}"
+                sleep ${LOCAL_DELAY}
+                IFS=","
+                for email in $LOCAL_MAILTO
+                do
+                    if [ "$( isEmail ${email} )" == "1" ]
+                    then
+                        echo -ne "RCPT TO: <${email}>${nl}"
+                        sleep ${LOCAL_DELAY}
+                    fi
+                done
+                IFS=$OLDIFS
+                echo -ne "DATA${nl}"
+                sleep ${LOCAL_DELAY}
+                echo -ne "SUBJECT: ${LOCAL_SUBJECT}${nl}"
+                sleep ${LOCAL_DELAY}
+                echo -ne "TO: <${recipient}>${nl}"
+                sleep ${LOCAL_DELAY}
+                echo -ne "Content-type: text/html${nl}"
+                sleep ${LOCAL_DELAY}
+                echo -ne "MIME-Version: 1.0${nl}"
+                sleep ${LOCAL_DELAY}
+                echo -ne "From: <${LOCAL_MAILFROM}>${nl}"
+                sleep ${LOCAL_DELAY}
+                echo -ne "Date: $(date -R)${nl}"
+                sleep ${LOCAL_DELAY}
+                echo -ne "${nl}"
+                echo -ne $LOCAL_CONTENT"${nl}"
+                sleep ${LOCAL_DELAY}
+                echo -ne ".${nl}"
+                sleep ${LOCAL_DELAY}
+                echo -ne "quit${nl}"
+            }
+
+
+        FWRESPONSE=$( openFirewall "$LOCAL_SMTPPORT" "SMTPout-$LOCAL_SMTPPORT" "9999" "0000" "tcp" )
+
+        sleep 2
+        echo "$FWRESPONSE"
+
+        FWRESPONSE=$( esxcli network firewall ruleset set --ruleset-id=SMTPout-$LOCAL_SMTPPORT --enabled=true )
+        if [ "$FWRESPONSE" != "" ]
+        then
+            echo "$FWRESPONSE"
+        fi
+
+        FWRESPONSE=$( esxcli network firewall refresh )
+        if [ "$FWRESPONSE" != "" ]
+        then
+            echo "$FWRESPONSE"
+        fi
+
+        SRVSTATUS=$( echo -n "EHLO ${HOSTNAME}\r\n" | nc ${LOCAL_SMTPSRV} ${LOCAL_SMTPPORT} -w 7 -i 3 2>/dev/null | sed -e 's/^ *//g' -e 's/ *$//g' )
+        if [ "${LOCAL_SMTPSRV//gmail/}" != "${LOCAL_SMTPSRV}" ]
+        then
+            exec 5>&1
+            if [ ${#SRVSTATUS} -eq 0 ]
+            then
+                echo -e "\033[0;31mGMail Module ::: The e-mail server [${LOCAL_SMTPSRV}] is not reachable at port [${LOCAL_SMTPPORT}]\033[0m"
+            else
+                MAILOUT=$( (mail_input | openssl s_client -key "$PWD"/xsibackup_id_rsa -CApath "$PWD" -pause -connect ${LOCAL_SMTPSRV}:${LOCAL_SMTPPORT} -ign_eof -crlf >&5) 2>/dev/null )
+                if [ "$MAILOUT" != "" ]
+                then
+                    IFS=$newline
+                    for mo in $MAILOUT
+                    do
+                        if [ "${mo//openssl.cnf/}" = "${mo}" ] && [ "${mo//self signed certificate in certificate chain/}" = "${mo}" ]
+                        then
+                            echo "$mo"
+                        fi
+                    done
+                    #IFS=$OLDIFS
+                fi
+            fi
+            exec 5>&-
+        elif [ "$LOCAL_SMTPSEC" = "tls" ]
+        then
+            exec 5>&1
+            if [ "${SRVSTATUS:0:3}" != "220" ]
+            then
+                echo -e "\033[0;31mTLS Module ::: The e-mail server [${LOCAL_SMTPSRV}] is not reachable at port [${LOCAL_SMTPPORT}]\033[0m"
+            else
+                MAILOUT=$( (mail_input | openssl s_client -key "$PWD"/xsibackup_id_rsa -CApath "$PWD" -starttls smtp -connect ${LOCAL_SMTPSRV}:${LOCAL_SMTPPORT} -ign_eof >&5) 2>&1 )
+                if [ "$MAILOUT" != "" ]
+                then
+                    IFS=$newline
+                    for mo in $MAILOUT
+                    do
+                        if [ "${mo//openssl.cnf/}" = "${mo}" ] && [ "${mo//self signed certificate in certificate chain/}" = "${mo}" ]
+                        then
+                            echo "$mo"
+                        fi
+                    done
+                    #IFS=$OLDIFS
+                fi
+            fi
+            exec 5>&-
+        else
+            exec 5>&1
+            if [ "${SRVSTATUS:0:3}" != "220" ]
+            then
+                echo -e "\033[0;31mPlain SMTP Module ::: The e-mail server [${LOCAL_SMTPSRV}] is not reachable at port [${LOCAL_SMTPPORT}]\033[0m"
+            else
+                MAILOUT=$( (mail_input | nc $LOCAL_SMTPSRV $LOCAL_SMTPPORT -w 7 || xsib_shutdown >&5) 2>&1 )
+                if [ "$MAILOUT" != "" ]
+                then
+                    IFS=$newline
+                    for mo in $MAILOUT
+                    do
+                        if [ "${mo//openssl.cnf/}" = "${mo}" ] && [ "${mo//self signed certificate in certificate chain/}" = "${mo}" ]
+                        then
+                            echo "$mo"
+                        fi
+                    done
+                    #IFS=$OLDIFS
+                fi
+            fi
+            exec 5>&-
+        fi
+
+        # We close the SMTP port
+        esxcli network firewall ruleset set --ruleset-id=SMTPout-$LOCAL_SMTPPORT --enabled=false
+        writeout "Firewall rule SMTPout-$LOCAL_SMTPPORT closed."
+
+}
+
+
+check_smtp(){
+
+    if [ "$( isEmail "$1" )" == "0" ]
+    then
+        echo -e "\033[0;31mError: the e-mail address ($1) argument must be set to an e-mail address\033[0m"
+        xsib_shutdown
+    fi
+    if [ "$2" -ne "$2" -o "$2" -lt "1" ]
+    then
+        echo -e "\033[0;31mError: the SMTP server argument ($2) must be set to an integer registered in the conf/smtpsrvs file\033[0m"
+        xsib_shutdown
+    fi
+
+    checkHTML="$( getTestEmailHTML )"	
+    sendMail "$1" "XSIBACKUP TEST E-MAIL" "$checkHTML" "$2"
+
+}
+

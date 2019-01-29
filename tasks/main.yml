@@ -10,11 +10,10 @@
     - "{{ xsibackup_working_dir }}/xsibackup-{{ xsibackup_version }}"
     - "{{ xsibackup_backup_dir }}"
 
-- name: Extract XSIBackup {{ xsibackup_version }} archive on target
-  unarchive:
-    src: "XSIBACKUP-FREE-{{ xsibackup_version }}.tar"
+- name: Copy XSIBackup {{ xsibackup_version }} folder
+  copy:
+    src: "XSIBACKUP-FREE-{{ xsibackup_version }}/"
     dest: "{{ xsibackup_working_dir }}/xsibackup-{{ xsibackup_version }}"
-    creates: "{{ xsibackup_working_dir }}/xsibackup-{{ xsibackup_version }}/xsibackup"
 
 - name: Symlink XSIBackup directory to versioned folder
   file:

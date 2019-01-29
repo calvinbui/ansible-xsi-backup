@@ -1,0 +1,112 @@
+#!/bin/sh
+
+if [ -d "$1" ]
+then
+    XWD="$1"
+else
+    echo "Please provide a dir to create the xsibackup-cron file"
+fi
+
+installCron(){
+    # If there is a previous xsibackup-cron file, we rename it
+    if [ -f "${XWD}"/xsibackup-cron ]
+    then
+        crontimestamp=$(date +%s)
+	mv "${XWD}"/xsibackup-cron "${XWD}"/xsibackup-cron.${crontimestamp}
+    fi
+    sed -i 's/exit 0//g' /etc/rc.local.d/local.sh
+    echo "/bin/kill \$(cat /var/run/crond.pid) && /bin/echo \"*/1 * * * * '${XWD}/xsibackup-cron' >> '${XWD}/xsibackup-cron.log' 2>&1\" >> /var/spool/cron/crontabs/root && /usr/lib/vmware/busybox/bin/busybox crond" >> /etc/rc.local.d/local.sh
+    echo "" >> /etc/rc.local.d/local.sh
+    echo "exit 0" >> /etc/rc.local.d/local.sh
+    cp "${XWD}"/conf/xsibackup-cron.sam "${XWD}"/xsibackup-cron
+    chmod 0700 "${XWD}"/xsibackup-cron 
+    # BusyBox sed is broken fails in line deletions so we
+    # inverse the file, take the whole minus de matched line
+    # and overwrite /var/spool/cron/crontabs/root
+    TAB=$( sed -n '/xsibackup/!p' /var/spool/cron/crontabs/root )
+    echo "$TAB" > /var/spool/cron/crontabs/root
+    /bin/echo "*/1 * * * * '${XWD}/xsibackup-cron' >> '${XWD}/xsibackup-cron.log' 2>&1" >> /var/spool/cron/crontabs/root
+    /bin/kill $(cat /var/run/crond.pid) && /usr/lib/vmware/busybox/bin/busybox crond 
+    echo -e "Removing cron info...\nAdding new cron info...\nThe local cron service will be restarted\nYou might need to reboot the ESXi server for the changes to take effect...\nESXi CRON SERVICE RESTARTED"
+}
+
+removeCron(){
+    # BusyBox sed is broken fails in line deletions so we
+    # inverse the file, take the whole minus the matched line
+    # and overwrite both files /etc/rc.local.d/local.sh and /var/spool/cron/crontabs/root
+    TAB1=$( sed -n '/xsibackup/!p' /etc/rc.local.d/local.sh )
+    echo "$TAB1" > /etc/rc.local.d/local.sh
+    TAB2=$( sed -n '/xsibackup/!p' /var/spool/cron/crontabs/root )
+    echo "$TAB2" > /var/spool/cron/crontabs/root
+    echo "Message: xsibackup-cron has been removed"
+}
+
+ISTHERE=$( grep -c "xsibackup-cron" /etc/rc.local.d/local.sh )
+if [ $ISTHERE -gt 0 ]
+then
+    if [ "$2" == "dialog" ]
+    then
+    	"$PWD"/bin/dialog \
+	--backtitle "XSIBACKUP-PRO Menu | Remove crontab" \
+    	--yesno "XSIBackup cron has already been installed to /etc/rc.local.d/local.sh\n\nDo you wish to remove it?" 10 40
+    	RETURN=$?
+    	if [ "$RETURN" -eq "3" ]
+    	then
+            "$PWD"/xsibackup --menu
+    	elif [ "$RETURN" -eq "1" ]
+    	then
+            "$PWD"/xsibackup --menu
+    	elif [ "$RETURN" -eq "0" ]
+    	then
+    	    removeCron | \
+	    "$PWD"/bin/dialog \
+	    --backtitle "XSIBACKUP-PRO Menu | Remove crontab" \
+	    --programbox 6 50
+	    "$PWD"/xsibackup --menu	
+	fi
+    else        
+        echo "XSIBackup cron has already been installed."
+        read -p "Do you wish to remove it? (y/n) " yn
+        case $yn in
+        	[Yy]* )
+       		removeCron 
+        exit 0;;
+        [Nn]* ) exit 0;;
+            * ) echo "Please answer (y)es or (n)o."; exit 0;;
+        esac
+    fi            	
+fi
+
+if [ "$2" == "dialog" ]
+then
+    "$PWD"/bin/dialog \
+    --backtitle "XSIBACKUP-PRO Menu | Install crontab" \
+    --yesno "This command will install XSIBackup cron to your ESXi > 5.1 BOX. xsibackup-cron will be installed to the dir: $XWD\n\nDo you wish to continue?" 13 89
+    RETURN=$?
+    if [ "$RETURN" -eq "3" ]
+    then
+        "$PWD"/xsibackup --menu
+    elif [ "$RETURN" -eq "1" ]
+    then
+        "$PWD"/xsibackup --menu
+    elif [ "$RETURN" -eq "0" ]
+    then
+        installCron | \
+        "$PWD"/bin/dialog \
+        --backtitle "XSIBACKUP-PRO Menu | Remove crontab" \
+        --programbox 10 84
+	"$PWD"/xsibackup --menu	        
+    fi
+else
+	echo "This command will install XSIBackup cron to your ESXi > 5.1 BOX"
+	echo "xsibackup-cron will be installed to the current working directory"
+	echo "You should cd to the desired directory before installing the cron"
+	read -p "Do you wish to continue? (y/n) " yn
+	case $yn in
+	    [Yy]* )
+		installCron	
+	    exit 0;;
+	    [Nn]* ) exit 0;;
+	        * ) echo "Please answer (y)es or (n)o."; exit 0;;
+	esac
+fi

@@ -1,0 +1,4259 @@
+#!/bin/sh
+{
+#################################################################################
+#                                                                               #
+#    XSIBACKUP Automated Backups for ESXi 5.1, 5.5, 6.0 & 6.5                   #
+#    By Daniel J. Garcia Fidalgo (33hops.com) daniel.garcia@33hops.com          #
+#    Copyright (C) 2013-2017 | 33HOPS, Sistemas de Informacion y Redes, S.L.    #
+#    ALL RIGHTS RESERVED                                                        #
+#                                                                               #	
+#################################################################################
+
+sync
+ulimit -s 512
+NOW="$( date +"%a %H:%M" | awk '{print tolower($0)}' )"
+NOW2="$( date +%d't'%H:%M )"
+hash -r
+
+if [ "$2" == "base64" ]
+then
+    keyvalstr="$( echo "$1" | openssl base64 -d 2>/dev/null )"
+    #echo "Executing remote job: $keyvalstr"
+else
+    keyvalstr="$@"
+fi
+
+DATEMASK="$( echo "$keyvalstr" | awk -F '--date-mask=' '{print $2}' | awk -F ' --' '{print $1}' | sed -e 's/^ *//g' -e 's/ *$//g' )"
+if [ "$DATEMASK" != "" ]
+then
+    if [ "$( echo "$DATEMASK" | grep '.*%H:%M$' | wc -l )" -eq "0" ]
+    then
+    	echo "The --date-mask argument must always end with '%H:%M' (hour:minute), $DATEMASK will be ignored"	
+    fi 
+fi
+uniqidst="$( echo "$(date)" | openssl sha1 2>/dev/null | awk -F '=' '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' )"
+
+PWD="$( cd "$( dirname "$0" )" && pwd )"
+if [ -d "$PWD/src/pro" ]
+then
+    APPNAM="XSIBACKUP-PRO"
+else
+    APPNAM="XSIBACKUP-FREE"
+fi    
+APPVER="11.0.1"
+APPCOM="(c) VMWARE ESXi Hypervisor"
+borgversions="1.1.1"
+OLDIFS=$IFS
+newline=$'\012'
+
+# Making sure the jobs directory contents are executable
+if [ -d "$PWD"/jobs ]
+then
+    chmod -R 0700 "$PWD"/jobs 2>/dev/null
+fi
+
+# Loading global vars in conf/xsiopts
+if [ -f "${PWD}"/conf/xsiopts ]
+then
+    . "${PWD}"/conf/xsiopts
+else
+    echo "ERROR: can't find config file at conf/xsiopts"
+fi
+
+if [ ! -d "$PWD"/var/logs ]
+then
+    mkdir -p "$PWD"/var/logs    
+fi
+
+if [ "${keyvalstr/--run-backup/}" != "$keyvalstr" ]
+then
+    backupid=$( echo "$keyvalstr" | grep -v '#' | awk -F '--run-backup=' '{print $2}' | awk -F '--' '{print $1}' )
+    jobfile="$PWD/jobs/$backupid"
+    if [ -f "$jobfile" ]
+    then    
+        backupjob=$( cat "$jobfile" | sed '/xsibackup\"/d' | sed '/xsibackup.log/d' | sed -e ':a;N;$!ba;s/\\\n//g' -e 's/ *\\$//g' )
+        if [ "$( echo "$backupjob" | grep "backup-id\=$backupid " | wc -l )" -eq "0" ]
+        then
+            backupjob="${backupjob} --backup-id=$backupid"
+        fi
+	else
+        echo "ERROR: can't find file [$jobfile]"	
+        exit 0
+    fi
+    keyvalstr=${backupjob}
+fi
+
+CURRDIR=$(dirname $0)
+if [ "${CURRDIR:0:1}" = "/" ]
+then
+    PWD="$CURRDIR"
+else
+    if [ "${CURRDIR//../}" != "$CURRDIR" ]
+    then
+        echo "You cannot execute $APPNAM from a higher path"
+        exit 0
+    fi
+    CURRDIR=${CURRDIR//./}
+    PWD="$PWD""$CURRDIR"
+fi
+
+separator="-"
+if [ -t 1 ]
+then
+    launched="user"
+    separator="\e[90m$separator\033[0m"
+    TW=$( stty size | cut -d ' ' -f 2 )
+    XSIDIFFSILENT=""
+    stty sane
+    echo -e "\033c"
+    clear
+else
+    if [ "${keyvalstr/--time/}" == "$keyvalstr" -a "$(echo "$keyvalstr" | sed -e 's/--exec=yes$//g' )" == "$keyvalstr" ]
+    then
+        exit 0
+    fi
+    launched="cron"
+    TW=130
+    XSIDIFFSILENT="--silent"
+fi
+
+algo=""
+hash1=""
+hash2=""
+backuproom=0
+ESX_VERSION=$(vmware -v | awk '{print $3}')
+ISTNET="$(esxcli network ip interface list | grep -E "^vmk*" | head -n1)"
+HOSTIP=$(esxcli network ip interface ipv4 get -i "${ISTNET}" | grep "${ISTNET}" | awk '{ print $2 }')
+HOSTMASK=$(esxcli network ip interface ipv4 get -i "${ISTNET}" | grep "${ISTNET}" | awk '{ print $3 }')
+CHECKRESULT=""
+VMOTIONVNIC=""
+
+if [ -f "$PWD"/src/functions ]
+then
+    . "$PWD"/src/functions
+else
+    echo "ERROR: can't find functions file at conf/functions"	
+fi
+
+rotate_log "$PWD/var/logs/xsibackup.log"
+
+gen_rsa_keys
+
+HOSTNAME="$( getHostname )"
+
+pid_cleanup
+
+create_errfile(){
+    rm -rf "${PWD}"/.ERR* 2>&1
+    errfileb="${PWD}/.ERR-${uniqidst}"
+    while [ ! -f "$errfileb" ]
+    do
+    	touch "$errfileb"
+    done
+}
+
+create_errfile
+
+ERR(){
+    if [ "$3" == "W" ]
+    then
+        c="warn"
+        t="WARNING"
+    else
+        c="errr"
+        t="ERROR"
+    fi
+    if [ "$1" != "" ]
+    then
+        if [ -f "$errfileb" ]
+        then
+            echo "<span class=${c}>[ $(date) ] <b>${t}</b> ($1), details $2</span><br>" >> "$errfileb"
+        else
+            echo "ERROR: cannot locate .ERR file at [$errfileb]"
+        fi
+        if [ "$3" != "W" ]
+        then
+            eval "VMERRS=\"${t} $1, details: $2\""
+        fi
+    fi
+}
+
+INCFILES=$( ls "${PWD}"/*.inc 2>/dev/null )
+for bf in $INCFILES
+do
+    source "$bf"
+done
+
+DEBUGINFO=""
+
+keyvalstr=${keyvalstr//--/*****}
+
+IFS="*****"
+for block in $keyvalstr
+do
+    if [ ! -z "$block" ]
+    then
+        VARNAM=$( echo $block | awk -F "=" '{print $1}' | sed -e 's/^ *//g' -e 's/ *$//g' )
+        VARNAM=${VARNAM//-/}
+        VARNAM=$( echo $VARNAM | awk '{print tolower($0)}' )
+        VARVAL="$( echo $block | awk -F "=" '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' )"
+        VARVAL="${VARVAL//"/\"}"
+        #VARVAL="${VARVAL//>/\>}"
+        if [ "$VARNAM" != "returnto" -a "$VARNAM" != "remotexsipath" -a "$VARNAM" != "checkxsitoolsvms" -a "$VARNAM" != "smtppwd" -a "$VARNAM" != "backupvms" -a "$VARNAM" != "backuppoint" -a "$VARNAM" != "subject" -a "$VARNAM" != "restorevms" -a "$VARNAM" != "excludevms" -a "$VARNAM" != "checkxsitoolsrepo" ]
+        then
+            VARVAL=$( echo "$VARVAL" | awk '{print tolower($0)}' )
+        fi
+        VARVAL="$( echo "$VARVAL" | sed 's/\"//g' )"
+		
+        if [ "$VARNAM" != "" -a "$VARVAL" != "" ]
+        then
+            #echo "$VARNAM=$VARVAL"
+            eval $VARNAM=\""$VARVAL"\"
+            DEBUGINFO="${DEBUGINFO}<br>&bull;&nbsp;${VARNAM}:&nbsp;$VARVAL"
+        fi
+    fi
+done
+IFS=$OLDIFS
+
+if [ "${#backupas}" -gt "0" ]
+then
+    defremusr="$backupas"
+fi
+
+keyvalstr=$( echo $keyvalstr | sed 's/\*\*\*\*\*/\-\-/g' )
+
+if [ "${keyvalstr/--set-crontab/}" != "$keyvalstr" ]
+then
+    setCrontab ${cronuser}
+    exit 0
+fi
+
+backupprog_options=$( echo $backupprog | awk -F ':' '{print $2}' )
+backupprog=$( echo $backupprog | awk -F ':' '{print $1}' )
+
+if [ "${backupprog_options//z/}" == "${backupprog_options}" ]
+then
+    SSH2COMP=" -o compression=no"
+    SSH1COMP=""
+else
+    SSH1COMP=" -C -o CompressionLevel=1"
+    SSH2COMP=" -o compression=yes"
+fi
+
+# SSHOPTS="-4 -o ControlMaster=auto -o ControlPath=/tmp/%r@%h:%p -o ControlPersist=40s -o PreferredAuthentications=publickey -o StrictHostKeyChecking=no -i "${PWD}"/xsibackup_id_rsa"
+# SSH protocol version 2
+# SSHOPTS="-2 -4 -o StrictHostKeyChecking=no"${SSH2COMP}" -i "${PWD}"/xsibackup_id_rsa"
+# SSH protocol version 1
+SSHOPTS="-4 -o StrictHostKeyChecking=no${SSH1COMP} -i \"${PWD}/xsibackup_id_rsa\""
+
+DEBUGINFO="${DEBUGINFO}<br>&bull;&nbsp;DATE DIR: $datedir"
+DEBUGINFO="${DEBUGINFO}<br>&bull;&nbsp;XSIDIR: $PWD"
+DEBUGINFO="${DEBUGINFO}<br>&bull;&nbsp;LAUNCHED BY: $launched"
+
+if [ "$backuphow" != "cold" -a "$backuphow" != "warm" ]
+then
+    backuphow="hot"
+fi
+
+if [ -z $from ] && [ "$launched" == "cron" ]
+then
+	rsyncbusy=0
+	if [ $( ps | grep xsibackup-rsync | wc -l ) -gt 0 ]
+	then
+	    rsyncbusy=1		
+	fi
+	if [ "$exec" = "yes" ]
+	then
+	    if [ "$rsyncbusy" -eq "1" ]
+	    then
+	    	writeout "ERROR: there are some ongoing rsync process/es loaded into memory. Clean them manually \ 
+	    	if no backup job is running now -> \e[1mkill -9 $( ps -c | grep rsync | awk '{print $1}')\033[0m"
+	    	exit 0
+	    fi
+	    righttime=1
+	    echo "$$ remote" >> "${PWD}/xsibackup-pid"
+	elif [ ! -z "${time}" ]
+	then
+	    righttime=0
+	    IFS="|"
+	    for moment in $time	
+	    do
+		if [ "$moment" == "$NOW" -o "$moment" == "$NOW2" ]
+		then
+		    righttime=1
+		fi
+	    done
+	    IFS=$OLDIFS
+	    if [ "${righttime}" == "0" ]
+	    then
+		exit 0
+	    else
+	    	if [ "$rsyncbusy" -eq "1" ]
+	    	then
+                    writeout "ERROR: there are some ongoing rsync process/es loaded into memory. Clean them manually \
+                    if no backup job is running now -> \e[1mkill -9 $( ps -c | grep rsync | awk '{print $1}')\033[0m"
+	    	    exit 0
+	    	fi    
+	    	echo "$$ cron" >> "${PWD}/xsibackup-pid"
+	    fi	
+	else
+	    exit 0
+	fi
+elif [ "$launched" == "user" ]
+then
+	if [ -f "$PWD/EULA" ]
+	then
+        	EULATEXT=$(cat "$PWD/EULA")
+        	EULATEXT="$EULATEXT"
+		READEULA=$(cat "$PWD/EULA" | head -n1)
+        	READEULA="$READEULA"
+		eval $READEULA
+        	if [ "$read" == "0" ]
+        	then
+				echo -e "$EULATEXT" | sed 1d | more
+				echo ""
+				read -p "I ACCEPT THE LICENSE AGREEMENT (yes/no) " yn
+				yn="$( echo "$yn" | awk '{print tolower($0)}' )"
+				case $yn in
+				[yes]* )
+					sed -i 's/read=0/read=1/g' "$PWD"/EULA
+					drawline
+					writeout "You can start now using \e[1m$APPNAM $APPVER\033[0m"
+					drawline
+					exit 0
+				;;
+				[no]* ) exit 0;;
+				* ) echo "Please answer (y)es or (n)o."; exit 0;;
+				esac
+        	fi
+        	if [ "$keyvalstr" != "" ]
+        	then
+        	    echo "$$ user" >> "${PWD}/xsibackup-pid"
+		fi
+	
+		if [ $# -eq 0 -o "${keyvalstr// /}" == "--menu" ]
+		then
+		    if [ -f "$PWD"/src/pro/menu/main ]
+		    then
+		        #export NCURSES_NO_UTF8_ACS=1
+		        exec "$PWD"/src/pro/menu/main
+		        exit 0
+		    fi
+		fi	
+			
+	else
+        	echo -e "\033[1;31mCannot find the EULA. The license agreement file [$PWD/EULA] must be kept.\033[0m"
+        	exit 0
+	fi
+elif [ "$exec" == "yes" ]
+then
+    	echo "$$ cron" >> "${PWD}/xsibackup-pid"
+fi
+
+if [ -t 1 ]
+then
+
+if [ "$APPNAM" == "XSIBACKUP-PRO" ]
+then
+proginf=$'
+\e[104m###############################################################################  \033[0m \e[104m \033[0m
+\e[104m#                                                                                \033[0m\e[104m \033[0m \e[104m \033[0m
+\e[104m#  \e[1m(c) --APPNAM-- --APPVER--\033[0m\e[104m | Backup for --APPCOM-- by \e[1m33hops.com  \033[0m \e[104m \033[0m \e[104m \033[0m
+\e[104m#                                                                                   \033[0m \e[104m \033[0m \e[104m \033[0m \e[104m \033[0m
+\e[104m###################################################################################\033[0m\e[104m  \033[0m \e[104m \033[0m \e[104m \033[0m \e[104m \033[0m \e[104m \033[0m \e[104m \033[0m
+'
+else
+proginf=$'
+\e[104m###############################################################################  \033[0m \e[104m \033[0m
+\e[104m#                                                                                \033[0m\e[104m \033[0m \e[104m \033[0m
+\e[104m#  \e[1m(c) --APPNAM-- --APPVER--\033[0m\e[104m | Backup for --APPCOM-- by \e[1m33hops.com \033[0m \e[104m \033[0m \e[104m \033[0m
+\e[104m#                                                                                   \033[0m \e[104m \033[0m \e[104m \033[0m \e[104m \033[0m
+\e[104m###################################################################################\033[0m\e[104m  \033[0m \e[104m \033[0m \e[104m \033[0m \e[104m \033[0m \e[104m \033[0m \e[104m \033[0m
+'
+fi
+else
+drawline
+proginf=$'
+###############################################################################
+   --APPNAM-- --APPVER--: new execution request                     
+###############################################################################
+'
+fi
+
+proginf="${proginf//--APPNAM--/$APPNAM}"
+proginf="${proginf//--APPVER--/$APPVER}"
+proginf="${proginf//--APPCOM--/$APPCOM}"
+writeout "${proginf}\r"
+
+if [ "${shellwarning}" != "" ]
+then
+    if [ "${shellwarning}" == "1" -o "${shellwarning}" == "0" -o "${shellwarning}" == "yes" -o "${shellwarning}" == "no" ]
+    then
+        setShellWarning $shellwarning
+    else
+        echo "You must parse 0 or 1 as the --shell-warning value"
+    fi
+    exit 0
+fi
+
+REQUESTKEY="$( ls -1 "$PWD"/request.key 2>/dev/null | wc -l )"
+if [ "$REQUESTKEY" -ne "1" ]
+then
+    "$PWD"/bin/xsidiff --request-license
+    writeout "A request.key file has been generated in the root of the installation dir"
+    writeout "You can use this request.key file to get a license for your (c) XSIDiff binary"
+    writeout "Login here with your registered e-mail address: \e[1mhttps://33hops.com/user-access.html\033[0m"
+fi
+LICENSEKEY="$( ls -1 "$PWD"/license.key 2>/dev/null | wc -l )"
+
+if [ -f "$PWD"/src/sendmail ]
+then
+    . "$PWD"/src/sendmail
+fi
+
+if [ "$checksmtp" != "" -a "$usesmtp" != "" ]
+then
+    check_smtp "$checksmtp" "$usesmtp"
+    xsib_shutdown	
+fi
+
+runRemCmd(){
+    RET="$( eval ssh "$SSHOPTS" -p$2 $defremusr@$1 "$3" )"
+    RET="$( echo "$RET" | sed '/FIPS mode initialized/d' )"
+}
+
+determineRemotePath(){
+    # We look for a file named xsibackup in the remote machine
+    # In case more than one is encountered a warning is raised
+    # and any directories containing .bak, _bak, .old, _old
+    # are discarded. If we still have more than one, we use the
+    # one hardcoded in the xsidefaultpath variable set above
+	
+    RemoteOS="$( eval ssh "$SSHOPTS" -p${2} ${defremusr}@${1} "uname \| awk \'{print \\\$1}\'" 2>/dev/null )"
+    RemoteOS="$( echo "$RemoteOS" | sed '/FIPS mode initialized/d' | awk '{print tolower($0)}' | sed -e 's/^ *//g' -e 's/ *$//g' )"
+    if [ "$RemoteOS" == "vmkernel" ]
+    then
+    	RemotePaths="$( eval ssh "$SSHOPTS" -p${2} ${defremusr}@${1} "find /vmfs/volumes -name xsibackup -type f -maxdepth 4 2\>/dev/null \| grep -vi _bak \| grep -vi .bak \| grep -vi _old \| grep -vi .old" 2>/dev/null )"
+    	RemotePaths="$( echo "$RemotePaths" | sed '/FIPS mode initialized/d' )"
+	RemPazNum="$(echo "$RemotePaths" | wc -l)"
+    	if [ "$RemPazNum" -ne "1" ]
+    	then
+    	    echo "local|$xsidefaultpath"
+    	else
+    	    RemotePaths=$(dirname "$RemotePaths")
+    	    if [ "$RemotePaths" == "." ]
+    	    then
+    	    	echo "remot|$xsidefaultpath"
+    	    else
+    	    	echo "remot|$RemotePaths"
+    	    fi
+    	fi
+    elif [ "$RemoteOS" == "linux" ]
+    then
+    	echo "Remote system is \e[1mLinux\033[0m|none"
+    else
+   	echo "Remote system is \e[1m${RemoteOS}\033[0m|none" 
+    fi	
+}
+
+isXSIRepo(){
+    ISREPO=1
+    if [ ! -d "$1"/data ]
+    then
+        ISREPO=0
+    fi
+    if [ -f "$1"/.xsitools ]
+    then
+    	GETDESC=$( cat "$1"/.xsitools | grep "Desc: XSITools Repo" | wc -l )
+    	if [ "$GETDESC" -ne "1" ]
+    	then
+    	    ISREPO=0
+    	fi
+    else
+    	ISREPO=0
+    fi
+    echo "$ISREPO"
+}
+
+humanread(){
+  echo $1 | awk '
+  function human(x) {
+    if (x<1000) {return x} else {x/=1024}
+    s="kMGTEPYZ";
+    while (x>=1000 && length(s)>1)
+      {x/=1024; s=substr(s,2)}
+    return int(x+0.5) substr(s,1,1)
+  }
+  {sub(/^[0-9]+/, human($1)); print}'
+}
+
+DEBUGINFO="${DEBUGINFO}<br>&bull;&nbsp;KEY: $SSHOPTS"
+
+if [ -f "$PWD"/src/xsitools ]
+then
+    . "$PWD"/src/xsitools
+    if [ "$checkxsitoolsrepo" != "" -o "$checkxsitoolsvms" != "" ]
+    then
+    	if [ -d "$checkxsitoolsrepo" ]
+    	then
+            xsiTools check "$checkxsitoolsrepo" "$mailto"
+    	    exit 0	
+    	fi
+    	if [ -d "$checkxsitoolsvms" ]
+    	then
+    	    xsiTools check "$checkxsitoolsvms" "$mailto"
+    	fi
+        echo -e "The provided path $checkxsitoolsrepo does not exist"
+        exit 0
+    fi
+fi
+
+if [ -f "$PWD"/src/pro/restore ]
+then
+    source "$PWD"/src/pro/restore
+    if [ "$restorevms" != "" ]
+    then
+        restore "$restorevms"
+    fi
+else
+    if [ "$APPNAM" == "XSIBACKUP-FREE" -a "$restorevms" != "" ]
+    then	
+	up2Pro "Restore"
+	xsib_shutdown	
+    fi
+fi
+
+if [ -f "$PWD"/src/pro/borg ]
+then
+    . "$PWD"/src/pro/borg
+fi
+
+if [ -f "$PWD"/src/pro/esxbackup ]
+then
+    . "$PWD"/src/pro/esxbackup
+fi
+
+if [ ! -z "$watch" ]
+then
+	if [ $( echo "$watch" | grep -oE "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$" | wc -l ) -eq 0 ] && [ "$watch" != "localhost" ] && [ "$watch" != "this" ]
+	then
+		echo -e "\033[0;31mThe provided IP cannot evaluated as an IPv4 address. Use [localhost] or [this] to refer to this same server\033[0m"
+		exit 0	
+	else
+	    if [ "$watch" = "localhost" ] || [ "$watch" = "this" ] || [ -f "${PWD}/xsibackup-cron-${watch}.log" ]
+	    then
+	    	watching="yes"
+		echo -e "Monitoring XSIBackup activity at \e[1m${watch}\033[0m"
+		echo -e "You can stop watching at any time by pressing \e[1m[Control+C]\033[0m"
+		echo -e "The remote backup process will continue at \e[1m${watch}\033[0m..."
+		echo "----------------------------------------------------------"
+		if [ "$watch" = "localhost" ] || [ "$watch" = "this" ]
+		then
+		    tail -n20 -f "${PWD}/xsibackup-cron.log"
+		else	
+		    if [ -f "${PWD}/xsibackup-cron-${watch}.log" ]
+		    then
+			tail -n20 -f "${PWD}/xsibackup-cron-${watch}.log"	
+		    else
+		    	echo -e "\033[0;31mCannot find the log file ${PWD}/xsibackup-cron-${watch}.log\033[0m" && exit 0
+		    fi	
+		fi
+	    else
+	    	echo -e "\033[0;31mNot a valid --watch value\033[0m" && exit 0
+	    fi	
+	fi
+fi
+
+if [ -f "$PWD"/src/pro/host -a "$APPNAM" == "XSIBACKUP-PRO" ]
+then
+    . "$PWD"/src/pro/host
+else
+    if [ "$host" != "" ]
+    then
+        up2Pro "Launching remote jobs"
+        xsib_shutdown
+    fi
+fi
+
+longdate=$( date '+%a, %d %b %Y %H:%M:%S %z' )
+newdirmask=$( date +%Y%m%d''%H%M%S )
+
+help=$'\033[0;36m--APPNAM-- --APPVER--\033[0m
+
+This is just a quick reference containing the most important arguments, please visit XSIBackup man page at: 
+http://33hops.com/xsibackup-help-man-page.html to document all arguments and options.
+
+RULES:
+Arguments are a list of variable/value pairs separated by an equal sign. 
+You can use any character to define values with the exception of double quotes (") and the equal sign (=).
+You must double quote variables if you use spaces or any scapable character.
+
+USAGE:
+Example 1 (backup all running VMs):
+xsibackup --backup-point=/vmfs/volumes/backup --backup-type=running --mail-from=email.sender@yourdomain.com 
+--mail-to=email.recipient@anotherdomain.com --smtp-srv=smtp.yourdomain.com --smtp-port=25 --smtp-usr=username 
+--smtp-pwd=password
+
+Example 2 (backup 3 VMs even if they are swiched off):
+xsibackup --backup-point=/vmfs/volumes/backup --backup-type=custom --backup-vms="WINDOWSVM1,LINUXVM2,New VM" 
+--mail-from=email.sender@yourdomain.com --mail-to=email.recipient@anotherdomain.com --smtp-srv=smtp.yourdomain.com 
+--smtp-port=25 --smtp-usr=username --smtp-pwd=password
+
+OPTIONS:
+
+--install-cron		This will install the cron system and file xsibackup-cron to the current dir.
+			You can add as many XSIBackup commands as you want into this file, one per line.
+			The only thing you have to do is add the parameter --time, i.e. --time="Mon 23:30".
+			You can find detailed instructions in the sample xsibackup-cron file.
+
+--backup-point		1) Full path to the backup mount point within the local server, it will tipically be under
+			/vmfs/volumes, i.e. /vmfs/volumes/backup, /vmfs/volumes/datastore2.
+			2) Full path in a remote ESXi host by using the following syntax:
+			--backup-point="IP.OF.REMOTE.SERVER:PORT:/full/path/to/datastore"
+			Example: --backup-point="192.168.1.200:22:/vmfs/volumes/datastore2
+			You need to previously link the remote server to this host by using --link-srv option.
+
+--backup-how		hot | cold
+			Hot (default): selected virtual machines are backed up without being switched off,
+			this is usefull for e-mail, http servers and VMs that cannot be switched off. If 
+			you do not specify a value for --backup-how a hot backup will be carried out.
+			Cold: selected VMs will be switched off before backup and turned on right afterwards.
+			Good if you need a reboot cicle from time to time to refresh resources and don\'t
+			mind having a little downtime. 
+
+--backup-type		custom | all | running
+			Custom: if this methos is chosen then a list of the VMs to backup must be passed to
+			the --backup-vms option.
+			All: backup -all- VMS.
+			Running: backup only running virtual machines.
+
+--date-dir		no (default) | yes
+			Determines if a date subfolder in the form yyyymmddhhmmss is created, if no is chosen
+			the backups will be directly made to the backup root overwriting files or adding the
+			differential data depending on the --backup-prog argument.
+
+--backup-vms		List of virtual machines to backup as a comma separated list. You can exclude disks by
+			adding an exclamation sign followed by a list of disks delimited by a semicolon [;]
+			Example: --backup-vms=VM1!scsi0:1;scsi0:2,VM2!disk1;disk2
+			You can use any string, full or partial, that may help identify the disk by its name
+			or by its device descriptor. Take on account that if you use an ambiguous string per
+			instance "scsi" more than one disk may be excluded. This parameter is only needed if 
+			custom is selected as the --backup-type.
+
+--backup-prog		Defaults to Rsync for TCP/IP backups and to vmkfstools for datastore backups, unless
+			explicitly set to rsync. In this case local copies will be done by means of rsync.
+
+--backup-room		Space that will be used for backups in gigabytes. Once this limit is reached the 
+			eldest backup folders with XSIBackup folder mask will be deleted. If this argument
+			is omitted all available space will be used.
+
+--test-mode=true	Allows testing backup procedure and e-mail submission without having to wait for a
+			full backup process. In this mode VMs are not copied to the backup disk.
+
+--smart-info=yes	Will add a complete S.M.A.R.T. report for every local disk, defaults to no.
+
+--mail-from		E-mail address as from where the HTML e-mail report will be sent.
+
+--mail-to		E-mail address to which the HTML e-mail report will be sent.
+
+--subject		Set your own subject for the e-mail report
+
+--smtp-srv		SMTP server that we will use to send the HTML e-mail report through.
+
+--smtp-auth		none|plain. You can choose plain text authentication or no authentication for SMTP
+			servers configured as open relays inside a controlled LAN. Use at your own risk.
+			If you set --smtp-auth to none you do not need to supply a username and password.
+
+--smtp-port		SMTP server port
+
+--smtp-usr		SMTP username used for authentication against the SMTP server.
+
+--smtp-pwd		SMTP password used for authentication against the SMTP server.			
+
+--smtp-sec		SMTP authentication scheme, set it =TLS (upper case) if needed, default is no 
+			encription. Your SMTP server must support secure renegotiation through the
+			regular SMTP port.
+
+--smtp-delay		Set number of seconds from 1 to 3. This will add a delay after the e-mail body and 
+			before the QUIT command. May help as a workaround with some e-mail servers like 
+			hMailServer. Use only as last resource.
+
+--link-srv		This command needs an argument like this --link-srv=192.168.0.100. It generates a DSA
+			key locally and adds it to the authorized_keys file at the remote host allowing to
+			communicate without a password.
+'
+
+###############################################
+#             HELP CONTENT END                #
+###############################################
+
+ord() {
+  LC_CTYPE=C printf '%d' "'$1"
+}
+
+chr() {
+  [ "$1" -lt 256 ] || return 1
+    printf "\\$(printf '%03o' "$1")"
+}
+
+get_file_b64(){
+
+        attdir=".xsibackup-att"
+        attext=".xsib64"
+
+        if [ ! -d "$attdir" ]
+        then
+                mkdir "$attdir"
+        fi
+
+        if [ "${1:0:7}" == "http://" ]
+        then
+                if [ ! -e $(pwd)"/$attdir/.${2}${attext}" ]
+                then
+                        wget -q "$1" -O "$(pwd)/$attdir/.${2}" && openssl enc -base64 -in "$(pwd)/$attdir/.${2}" > "$(pwd)/$attdir/.${2}${attext}"
+                else
+                        thefile1=$(cat $(pwd)"/$attdir/.${2}${attext}")
+                        wget -q "$1" -O "$(pwd)/$attdir/.${2}" && thefile2=$(cat "$(pwd)/$attdir/.${2}")
+                        if [ "$thefile1" != "$thefile2"  ]
+                        then
+                                openssl enc -base64 -in "$(pwd)/$attdir/.${2}" > "$(pwd)/$attdir/.${2}${attext}"
+                        fi
+                fi
+        else
+                if [ ! -e $(pwd)"/$attdir/.${2}${attext}" ]
+                then
+                        openssl enc -base64 -in "$1" > "$(pwd)/$attdir/.${2}${attext}"
+                else
+                        thefile1=$(cat "$1")
+                        thefile2=$(cat "$(pwd)/$attdir/.${2}${attext}")
+                        if [ "$thefile1" != "$thefile2"  ]
+                        then
+                                openssl enc -base64 -in "$1" > "$(pwd)/$attdir/.${2}${attext}"
+                        fi
+                fi
+        fi
+
+}
+
+if [ -f "$PWD"/src/pro/smartinfo ]
+then
+    . "$PWD"/src/pro/smartinfo
+fi
+
+is_running(){
+    #echo $(esxcfg-info | grep sh.${1} | grep "Group Name" | grep -c ^)
+    IR=$( ps | grep ${1} | wc -l )
+    echo $IR
+}
+
+if [ "$keyvalstr" != "" ]
+then
+    pid_cleanup
+    RUNNUMBER=$( cat "${PWD}/xsibackup-pid" > /dev/null 2>&1 | grep -v $$ | grep cron | wc -l )
+    MERUNNING=$( cat "${PWD}/xsibackup-pid" > /dev/null 2>&1 2>&1 | grep -v $$ | grep cron )
+    if [ ${RUNNUMBER} -gt 0 ]
+    then 
+        echo "----------------------------------"
+        echo "|  Running XSIBackup processes:  |"
+        echo "----------------------------------"
+        echo "$MERUNNING"
+        drawline
+        #cat "${PWD}/xsibackup-pid" 2>&1    
+    	if [ "${time}" != "" ]
+    	then
+	    echo ""
+            echo "###########################################################"
+            echo ""
+            echo $(date +"%a %H:%M:%S") : "WARNING"
+            echo ""
+            echo "XSIBackup was launched from the cron file without user input"
+            echo "But another cron XSIBackup process is still running. Only one"
+            echo "XSIBackup process is allowed at a time per host. You may use"
+            echo "the --on-success and --on-error arguments to chain backups"
+            echo "This execution request will be ignored."
+            echo ""
+            echo "###########################################################"
+	    echo ""
+	    exit 0
+    	fi
+    fi
+    
+    # PIDs that cannot be killed
+    # PIDs in the pid file
+    EXCPID=$( cat "$PWD"/xsibackup-pid | grep -E "cron|remote|sshpipe" | awk '{print $1}' | sort -u )
+    # Current PID
+    EXCPID="$EXCPID${newline}$$"
+    # PID of vi xsibackup
+    xsipp="$( ps -c | grep "vi xsibackup" | awk '{print $1}' )"
+    EXCPID="$EXCPID${newline}$xsipp"
+    # PIDs of menus
+    menup="$( ps -c | grep "menu" | awk '{print $1"\n"$2}' | sort -u )"
+    EXCPID="$EXCPID${newline}$menup"
+    # PIDs of dialog
+    diagp="$( ps -c | grep "dialog" | awk '{print $1"\n"$2}' | sort -u )"
+    EXCPID="$EXCPID${newline}$diagp" 
+    for excpid in $EXCPID
+    do
+    	parchi="$( ps -c | grep $excpid | awk '{print $1"\n"$2}' | sort -u )"
+    	EXCPID="$EXCPID${newline}$parchi"
+    done
+    EXCPID="$( echo "$EXCPID" | sed -e ':a;N;$!ba;s/\n/|/g' | awk 'BEGIN{RS=ORS="|"} !seen[$0]++' | sed '$s/.$//' )" 
+
+    RUNNPROCS=$( ps -c | grep -E "xsibackup|rsync" | grep -v -E "$EXCPID" | awk '{print $1}' )
+    if [ "$( echo "$RUNNPROCS" | wc -l )" -gt "0" ]
+    then
+    	writeout "NOTICE: (c) XSIBackup kills any user launched jobs, make sure you don't overlap manual jobs"
+    	drawline
+    fi
+    SHOWNEWVER=""
+    
+    CURRPROVER=""
+    if [ "$checkver" == "yes" ]
+    then
+    	CURRPROVER=$(wget -T2 -qO- http://a.33hops.com/xsibackup-pro-ver.txt 2>/dev/null)
+    fi
+    
+    if [ "${#CURRPROVER}" -gt "0" ]
+    then
+   	if [ "$APPVER" \< "$CURRPROVER" ]
+   	then
+   	    SHOWNEWVER="$CURRPROVER"
+   	    writeout "\e[1mNOTICE: (c) XSIBackup-Pro $CURRPROVER is available to download\033[0m"
+   	    drawline	    	
+   	fi 
+    fi
+    IFS=$newline	
+    for proc in $RUNNPROCS
+    do
+	if [ "$proc" -ne "$$" ]
+	then
+	    #echo "KILL | $( ps -c | grep "${proc}" ) |"
+	    KILLMR=$( kill -9 $proc 2>/dev/null )
+	fi
+    done    
+    IFS=$OLDIFS
+fi
+
+HOSTUUID=$( vim-cmd hostsvc/hosthardware | grep uuid | awk -F "=" '{print $2}' ) && HOSTUUID=${HOSTUUID// /} && HOSTUUID=${HOSTUUID//,/} && HOSTUUID=${HOSTUUID//\"/}
+SESSIONID=$HOSTUUID$(date +%s) && SESSIONID=$( echo $SESSIONID | openssl base64 2> /dev/null ) && SESSIONID=${SESSIONID// /} && SESSIONID=${SESSIONID//=/}
+
+echo -n "XSIBackup PID: $( printf "%16s" "$$" )"
+printf "%64s\n" "$HOSTNAME"
+
+DEBUGINFO="${DEBUGINFO}<br>&bull;&nbsp;PID: $$"
+
+if [ "${ESX_VERSION}" != "5.1.0" -a "${ESX_VERSION}" != "5.5.0" -a "${ESX_VERSION}" != "6.0.0" -a "${ESX_VERSION}" != "6.5.0" -a "${ESX_VERSION}" != "6.7.0" ]
+then
+    writeout "\033[0;31mOnly ESXi 5.X and 6.X series are supported. It will not work in previous versions of ESXi.\033[0m"
+    writeout "\033[0;31mCompatibility with ESXi 6.7 is still under development, you can enable at your own risk, only local backups will work.\033[0m"
+    exit 1
+fi
+
+DEBUGINFO="${DEBUGINFO}<br>&bull;&nbsp;ESXi VERSION: $ESX_VERSION"
+
+if [ "${keyvalstr// /}" == "--help" ]
+then
+        echo -e "\033[0;36mPreparing help, please wait...\033[0m"
+        help=${help//--APPNAM--/$APPNAM}
+        #help=${help//--APPCOM--/$APPCOM}
+        help=${help//--APPVER--/$APPVER}
+        echo "$help"
+        exit 0
+fi
+
+if [ "$linksrv" != "" ]
+then
+    link_to_host "$linksrv"
+    xsib_shutdown
+fi
+
+if [ "${keyvalstr//--install-cron/}" != "${keyvalstr}" ]
+then
+    drawline
+    installCron ${cronuser} 
+    drawline
+    xsib_shutdown	
+fi
+
+if [ "${keyvalstr//--update-cron/}" != "${keyvalstr}" ]
+then
+    drawline
+    "$PWD"/src/cron-init "${USER}"
+    drawline
+    xsib_shutdown	
+fi
+
+if [ "${keyvalstr//--remove-cron/}" != "${keyvalstr}" ]
+then
+    drawline
+    removeCron ${cronuser}
+    drawline
+    xsib_shutdown
+fi
+        
+                
+echo -ne "$longdate"
+printf "%64s\n" "IPv4: $HOSTIP/$HOSTMASK"
+echo -ne "$( vmware -v )"
+printf "%64s\n" "(c) Rsync 3.1.0 as opt. dependency"
+drawline
+
+if [ "$backupid" != "" ]
+then
+    echo -n "Backup Id: $( printf "%20s" "$backupid" )"
+else
+    echo -n "Backup Id: $( printf "%20s" "unknown" )"
+fi
+CPU=$( getCPUInfo )
+if [ "$CPU" == "" ]
+then
+    CPU="Unknown CPU"
+fi
+printf "%65s\n" "$CPU"
+drawline
+
+if [ "$description" != "" ]
+then
+    writeout "Backup description: $description"
+    drawline	
+fi
+
+if [ "$( cat /etc/rc.local.d/local.sh | grep "cron-init\" ${USER}" | wc -l )" -eq "1" ]
+then
+    writeout "Message: crontab is installed for user ${USER}"
+    drawline
+else
+    writeout "Alert: crontab is not installed for user ${USER}"
+    drawline
+fi
+
+SSDdisks=$( esxcli storage core device list | grep "Is SSD: true" | wc -l )
+CacheDsk=$( esxcli storage vflash device list | sed 1,2d | wc -l )
+
+if [ "${keyvalstr/--disable-vmotion/}" != "$keyvalstr" ]
+then
+    disableVMotion
+    drawline
+fi
+
+if [ $SSDdisks -eq 0 ]
+then
+    writeout "\033[0;36mADVICE: no SSD disks, please consider adding an SSD cache disk to improve performance\033[0m"
+    drawline
+elif [ $SSDdisks -eq 1 ]
+then
+    if [ $CacheDsk -lt 1 ]
+    then
+    	writeout "\033[0;36mADVICE: just one SSD has been detected, you should consider to use it as an SSD cache disk to improve performance\033[0m"
+        drawline
+    fi
+elif [ $SSDdisks -gt 1 ]
+then
+    if [ $CacheDsk -lt 1 ]
+    then
+    	writeout "\033[0;36mADVICE: great!, multiple SSD disks have been detected, please use one of them as an SSD cache disk to improve performance\033[0m"
+        drawline
+    fi
+else
+    writeout "\033[0;36mError: detecting SSD disks\033[0m"
+    drawline
+fi
+
+if [ "$backupprog" == "xsitools" ]
+then
+    datedir="yes"
+fi
+force_rsync=0
+if [ "${backupprog_options//f/}" != "${backupprog_options}" -a ${backupprog} == "rsync" ]
+then
+    force_rsync=1	
+fi
+
+DO_BACKUP=1
+
+writeout "Backup user is: \e[1m$defremusr\033[0m"
+drawline
+
+if [ "$backupprog" != "" ]
+then
+    if [ "$backupprog" == "borg" ]
+    then
+        PROGNOTICE=" (compatible with Borg versions: $borgversions)"	
+    fi	
+    writeout "Backup program is: \e[1m${backupprog}${PROGNOTICE}\033[0m"
+    drawline	
+fi
+
+if [ "${backuppoint}" == "" ]
+then
+    writeout "\033[0;31mThe --backup-point string is a mandatory value\033[0m"	
+    DO_BACKUP=0
+else
+	numtok="$( echo "${backuppoint}" | awk -F ':' '{print NF}' )"
+	lsttok="$( echo "${backuppoint}" | awk -F ':' '{print $NF}' )"
+	if [ "$lsttok" == "F" ]
+	then
+	     backsrvtrf="F"	
+	fi
+	if [ "${numtok}" -eq "4" ]
+	then
+	    backuppointds="$( echo "${backuppoint}" | awk -F ':' '{print $3}' | awk -F '/vmfs/volumes/' '{print $2}' | awk -F '/' '{print $1}' )"
+	elif [ "${numtok}" -eq "3" ]
+	then
+	    backuppointds="$( echo "${backuppoint}" | awk -F ':' '{print $3}' | awk -F '/vmfs/volumes/' '{print $2}' | awk -F '/' '{print $1}' )"	
+	elif [ "${numtok}" -eq "2" ]
+	then
+	    backuppointds="$( echo "${backuppoint}" | awk -F ':' '{print $1}' | awk -F '/vmfs/volumes/' '{print $2}' | awk -F '/' '{print $1}' )"    	
+	    backuppoint="$( echo "${backuppoint}" | awk -F ':' '{print $1}' )"
+	else
+	    backuppointds="$( echo "${backuppoint}" | awk -F ':' '{print $NF}' | awk -F '/vmfs/volumes/' '{print $2}' | awk -F '/' '{print $1}' )"	
+	fi
+	
+    	if [ "${backuppoint:$((${#backuppoint}-1)):1}" == "/" ]
+    	then
+	    backuppoint="${backuppoint:0:$((${#backuppoint}-1))}"    
+    	fi	
+	if [ "${backuppoint:0:1}" == "/" ]
+	then
+	    if [ ! -d "${backuppoint}" ]
+	    then
+	    	CREATED=$( mkdir -p "${backuppoint}" )
+	    	if [ "$CREATED" == ""  ]
+	    	then
+	    	    created=yes	
+	    	else
+		    writeout "\033[0;31mFailed to create --backup-point at ${backuppoint}, details: $CREATED\033[0m"	
+		    drawline
+		fi
+	    fi	
+	elif [ "${backuppoint:0:1}" == "." ]
+	then
+	    backuppoint="$( readlink -f $backuppoint )"
+            if [ ! -d "${backuppoint}" ]
+            then
+                CREATED=$( mkdir -p "${backuppoint}" )
+                if [ "$CREATED" == ""  ]
+                then
+                    created=yes
+                else
+		    writeout "\033[0;31mFailed to create --backup-point at ${backuppoint}, details: $CREATED\033[0m"	    	
+		fi
+            fi
+	fi
+	
+	if [ -f "$backuppoint"/.xsitools ]
+	then
+	    writeout "\e[1m$backuppoint\033[0m is an XSITools repo"
+	    drawline
+	    ISCOMP=$( cat "$backuppoint"/.xsitools | grep Comp | awk -F ': ' '{print $2}' )
+            if [ "${backupprog_options//z/}" != "${backupprog_options}" ]
+            then
+                compression=1
+            else
+                compression=0
+            fi
+	    if [ "$ISCOMP" -ne "$compression" ]
+	    then 
+            	if [ "$compression" == "0" ]
+            	then
+                    writeout "\033[1;31mXSITools Error XSITCMP1: $backuppoint is a compressed repository, you must enable compression to backup to it\033[0m"
+            	else
+                    writeout "\033[1;31mXSITools Error XSITCMP1: $backuppoint is an uncompressed repository, you cannot backup to it with compression enabled\033[0m"
+            	fi
+            	ERR XSITCOMP "Error: $backuppoint compression yes/no related error"
+	    fi	
+	fi
+
+	if [ "${backuppoint:0:1}" == "/" -a -d "${backuppoint}" ]
+	then
+                BPFS="$( df | grep -E "(/vmfs/volumes/${backuppointds}$)" | awk '{print $1}' )"
+		if [ "$created" == "yes" ]
+		then		
+		    state="created"	
+		else
+		    state="found"	
+		fi
+		writeout "--backup-point $state at \e[1m${backuppoint}\033[0m (filesystem: $BPFS)"
+		drawline
+		baksrvdire="$backuppoint"
+		SERVERTYPE="DIR"
+	else
+	    if [ "${backuppoint:0:1}" == "/" ]
+	    then
+		writeout "\033[0;31mBad --backup-point, the directory ${backuppoint} does not exist and the previous attempt to create it failed, check why\033[0m"
+		ERR BAKPOIN1 "Error: $backuppoint does not exist and the previous attempt to create it failed"
+	    else
+		# The backup point might be a server
+		IFS=":"
+                side=0
+                for eachside in $backuppoint
+                do
+                    if [ $side -eq 0 ]
+                    then
+                	theIp=$( ping -c 1 "$eachside" 2>/dev/null | head -n1 | awk -F "(" '{print $2}' | awk -F ")" '{print $1}' )
+                        if [ $( echo "$theIp" | grep -oE "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$" | wc -l 2>/dev/null ) -eq 0 ]
+                        then
+                            writeout "\033[0;31mThe --backup-point is not a directory and can't be evaluated as a server either\033[0m"
+                            writeout "\033[0;31m${eachside} can't be evaluated as an IPv4 address\033[0m"
+                            ERR BAKPOIN2 "Error: ${eachside} can't be evaluated as an IPv4 address"
+                        fi
+                        baksrvaddr="$theIp"
+                    elif [ $side -eq 1 ]
+                    then
+                        baksrvport="$eachside"
+                    elif [ $side -eq 2 ]
+                    then
+                        baksrvdire="$eachside"
+                    elif [ $side -eq 3 ]
+                    then
+                        backsrvtrf="$eachside"
+                    fi
+                side=$(( $side+1 ))
+                done
+		IFS=$OLDIFS
+		srvchkstr=$( checksrv "$baksrvaddr:$baksrvport" "OpenSSH" )
+		if [ "$srvchkstr" -eq "1" ]
+		then
+		    SERVERTYPE="NET"
+		    if [ "$backupprog" != "onediff" -a "$backupprog" != "rsync" -a "$backupprog" != "xsidiff" -a "$backupprog" != "borg" ]
+		    then 
+			writeout "\033[0;31mInvalid --backup-prog value, IP backups only with progs: rsync | onediff | borg\033[0m"
+			ERR BAKPOIN3 "Error: invalid --backup-prog value, IP backups only with progs: rsync | onediff | borg"
+		    fi
+		    writeout "Service OpenSSH ready at server $baksrvaddr:$baksrvport"	
+		    drawline	
+		    if [ "$backupprog" == "rsync" -o "$backupprog" == "onediff" -o "$backupprog" == "xsidiff" ]
+		    then
+        		if [ "$remotexsipath" != "" ]
+        		then
+            		    xsidefaultpath="$remotexsipath"
+            		    writeout "Info: remote $APPNAM install dir has been set by means of the --remote-xsipath argument"
+            		    drawline		    	
+		    	else
+		    	    # Trying to determine remote XSIBackup installation path
+		    	    # If there's more than one installation point, or the path
+		    	    # cannot be found, then hardcoded value is used instead		
+		    	    writeout "Info: $APPNAM will now try to determine the remote's $APPNAM installation point..."
+		    	    writeout "Tip: should this process take too long, use the --remote-xsipath argument to set it"
+		    	    drawline
+					
+					xsidefaultpath=$( determineRemotePath $baksrvaddr $baksrvport )
+
+		    	    xsidf_typ=$( echo $xsidefaultpath | awk -F '|' '{print $1}' )
+		    	    xsidefaultpath=$( echo $xsidefaultpath | awk -F '|' '{print $2}' )
+		    	    if [ "$xsidf_typ" == "local" ]
+		    	    then
+			    	writeout "Found more than one remote (c) XSIBackup installation dir at [$baksrvaddr]"
+			    	writeout "Using hardcoded var at conf/\e[1mxsiopts\033[0m [xsidefaultpath] as remote path."
+		    	    else
+			    	writeout "Found (c) XSIBackup installation. Remote path is set dynamically"
+		    	    fi
+		    	    drawline
+		    	fi
+		    	BPFS="$( eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "\"if [ \\\"\\\$(uname -a | awk '{print \\\$1}' )\\\" == \\\"VMkernel\\\" ];then df | grep -E \\\"/vmfs/volumes/${backuppointds}\\\$\\\" | awk '{print \\\$1}';else echo 'UNKNOWN';fi\"" 2>/dev/null )"
+		    	BPFS="$( echo "$BPFS" | sed '/FIPS mode initialized/d' )"
+			if [ "$BPFS" == "" ]
+			then
+			    BPFS="unknown"
+			fi
+			writeout "\e[1mRemote xsi path set to: $xsidefaultpath\033[0m (filesystem: $BPFS)"
+			drawline
+		    fi
+		else
+		    writeout "\033[0;31mThe server --backup-point=${backuppoint} does not exist\033[0m"
+		    writeout "\033[0;31mMake sure there is an SSH server listening on $baksrvaddr port $baksrvport and that the firewall allows this connection\033[0m"
+		    DO_BACKUP=0
+		fi
+	    fi
+	fi	
+fi
+
+if [ "$backupprog" == "rsync" -o "$backupprog" == "xsidiff" -o "$backupprog" == "onediff" ] && [ "$SERVERTYPE" == "NET" ]
+then
+	if [ "${backupprog_options//z/}" != "$backupprog_options" ]
+	then
+		#RSSSHOPTS="-o Compression=yes -o CompressionLevel=1"
+		#BOSSHOPTS="-o Compression=yes -o CompressionLevel=1"
+		#writeout "\033[0;36mCompression has been set, this may help if you have a lot of empty space in your disks and you backup over WAN\033[0m"
+		#writeout "\033[0;36mIf you are using (c)XSIDiff and your disks are thin, compression will not be of any help, you should turn it off\033[0m"
+		writeout "\033[0;36mCompression option is deprecated since XSIBackup 10.0.4, SSH 2.0 is forced since this version and it handles compression dynamically\033[0m"
+	fi
+	if [ "${backupprog_options//u/}" != "$backupprog_options" ]
+	then
+		UPDATERSYNC="1"
+		RMRSYNCPATH="${xsidefaultpath}/bin/xsibackup-rsync"
+		RMXSIDFPATH="${xsidefaultpath}/bin/xsidiff"
+	else
+		# Check if remote machine is ESXi
+		REMOTEOS=$( eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "\"uname | awk '{print \\\$1}'\"" 2>/dev/null )
+		REMOTEOS=$( echo "$REMOTEOS" | sed '/FIPS mode initialized/d' | awk '{print tolower($0)}' )
+		# Find Rsync path in remote system
+		FRSYNCPATH="$( eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "find /usr/bin /bin /usr/local/bin -type f -size +200000c -name rsync 2>/dev/null | head -n1" 2>/dev/null )"
+		FRSYNCPATH="$( echo "$FRSYNCPATH" | sed '/FIPS mode initialized/d' )"
+		RMXSIDFPATH="$( eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "find /usr/bin /bin /usr/local/bin -type f -size +200000c -name xsidiff 2>/dev/null | head -n1" 2>/dev/null )"
+		RMXSIDFPATH="$( echo "$RMXSIDFPATH" | sed '/FIPS mode initialized/d' )"
+		if [ "$REMOTEOS" == "vmkernel" ]
+		then
+		    # Get remote ESXi version
+		    REMESXiVers=$( eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "\"vmware -v | awk '{print \\\$3}'\"" 2>/dev/null )
+		    REMESXiVers="$( echo "$REMESXiVers" | sed '/FIPS mode initialized/d' )"
+		    writeout "Remote ESXi version is $REMESXiVers"
+		    drawline
+		    
+		    UPDATERSYNC="1"	
+		    RMRSYNCPATH="${xsidefaultpath}/bin/xsibackup-rsync"		
+		    RMXSIDFPATH="${xsidefaultpath}/bin/xsidiff"	
+		elif [ "$REMOTEOS" == "linux" ]
+		then
+		    if [ "$backupprog" == "onediff" ]
+		    then
+		    	writeout "\033[0;31mFatal error: OneDiff backups can only be performed to another ESXi system\033[0m"
+		 	ERR NETBAKO1 "Error: OneDiff backups can only be performed to another ESXi system"   	
+		    	DO_BACKUP=0
+		    fi
+		    UPDATERSYNC="0"
+		    if [ "$FRSYNCPATH" != "" ]
+		    then
+		    	RMRSYNCPATH="$FRSYNCPATH"
+		    else
+		    	writeout "\033[0;31mFatal error: cannot locate Rsync binary at [ $baksrvaddr ], copy it to /bin directory\033[0m"
+		    	ERR NETBAKR2 "Error: cannot locate Rsync binary at [ $baksrvaddr ]"
+		    	RMRSYNCPATH=""
+		    	DO_BACKUP=0
+		    fi
+
+		    if [ "$RMXSIDFPATH" == "" ]
+                    then
+                        writeout "\033[0;31mFatal error: cannot locate (c) XSIDiff binary at [ $baksrvaddr ], copy it to your /bin directory\033[0m"
+                        ERR NETBAKR2 "Error: cannot locate (c) XSIDiff binary at [ $baksrvaddr ]"
+                        RMXSIDFPATH=""
+                        DO_BACKUP=0
+                    fi
+		    
+		    if [ "$backupprog" == "xsidiff" ]
+		    then
+		    	writeout "Notice: do not forget to place your XSIDiff binary to your path /bin or /usr/bin"
+		    	RMXSIDFPATH="xsidiff"
+		    fi
+		else
+		    UPDATERSYNC="0"
+                    if [ "$FRSYNCPATH" != "" ]
+                    then
+                        RMRSYNCPATH="$FRSYNCPATH"
+                    else
+                        RMRSYNCPATH=""
+		    fi	
+		fi
+		if [ "$backupprog" == "rsync" -o "$backupprog" == "xsidiff" ] && [ RMRSYNCPATH == "" ]
+		then
+		    writeout "\033[0;31mCannot find Rsync in the remote system [ $baksrvaddr ], backup cannot take place\033[0m"
+		    writeout "Make sure that Rsync is installed on the remote end or force use of xsibackup-rsync"
+		    ERR NETBAKR3 "Error: cannot find Rsync in the remote system [ $baksrvaddr ]"	
+		    DO_BACKUP=0
+		fi
+	fi
+fi
+
+if [ "${REMESXiVers:0:3}" == "6.7" ]
+then
+     writeout "ATTENTION: ${APPNAM} ${APPVER} support for ESXi 6.7.0 is still experimental, use with caution"
+     drawline
+     ERR ESX67CA2 "ATTENTION: ${APPNAM} ${APPVER} support for ESXi 6.7.0 is still experimental, use with caution" W
+fi
+
+if [ "${ESX_VERSION}" == "6.5.0" -a "$REMESXiVers" == "6.5.0" -a "$backupprog" == "rsync" ]
+then
+    SSHOPTS="$SSHOPTS -o KexAlgorithms=curve25519-sha256@libssh.org"
+    certifybackup="yes"
+fi
+
+if [ "$SERVERTYPE" = "NET" ] && [ "$backupprog" == "rsync" -o "$backupprog" == "xsidiff" -o "$backupprog" == "onediff" ]
+then
+    writeout "Mirroring to server "$baksrvaddr" port "$baksrvport
+    writeout "Checking Rsync exists on the other side..."
+    drawline
+    if [ "$UPDATERSYNC" == "1" ]
+    then
+	if [ $(compHashes "$PWD"/bin/xsibackup-rsync "$baksrvaddr:$baksrvport:$RMRSYNCPATH") == "0" ]
+	then
+	    writeout "\033[0;36mxsibackup-rsync needs to be copied/updated in the remote server\033[0m"
+	    REMDIR=$( dirname "$RMRSYNCPATH" )
+	    # Make remote dir, if it does not exist
+	    MKREMDIR=$( eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "mkdir -p \"$REMDIR\"" 2>/dev/null )
+	    MKREMDIR="$( echo "$MKREMDIR" | sed '/FIPS mode initialized/d' )"
+	    eval scp "$SSHOPTS" -P$baksrvport "$PWD"/bin/xsibackup-rsync ${defremusr}@$baksrvaddr:"${RMRSYNCPATH//\ /\\ }" 2>/dev/null
+	    drawline
+	else	
+	    writeout "(c) Rsync (samba.org) found at [ $baksrvaddr:$baksrvport:${RMRSYNCPATH:0:48}... ]"		
+	    drawline
+	fi
+	RMXSIDIFFPATH=$( dirname "$RMRSYNCPATH" )"/xsidiff"
+        if [ $(compHashes "$PWD"/bin/xsidiff "$baksrvaddr:$baksrvport:$RMXSIDIFFPATH") == "0" ]
+        then
+            writeout "\033[0;36m(c)XSIDiff needs to be copied/updated in the remote server\033[0m"
+            REMDIR=$( dirname "$RMRSYNCPATH" )
+            # Make remote dir, if it does not exist
+            MKREMDIR=$( eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "mkdir -p \"$REMDIR\"" 2>/dev/null )
+            MKREMDIR="$( echo "$MKREMDIR" | sed '/FIPS mode initialized/d' )"
+	    eval scp "$SSHOPTS" -P$baksrvport "$PWD"/bin/xsidiff ${defremusr}@$baksrvaddr:"${RMXSIDIFFPATH//\ /\\ }" 2>/dev/null
+            drawline
+        else
+            writeout "(c) XSIDiff found at [ $baksrvaddr:$baksrvport:${RMXSIDIFFPATH:0:58}... ]"
+            drawline
+        fi
+    else
+	writeout "(c) Rsync (samba.org) found at [ $baksrvaddr:$baksrvport:${RMRSYNCPATH:0:48}... ]"	
+        drawline
+    fi
+fi
+
+if [ -z "$backuptype" ]
+then
+        writeout "\033[0;31mYou have to set the variable --backup-type to some of the values described in the help\033[0m"
+	DO_BACKUP=0
+else
+	if [[ "$backuptype" == "custom" ]]
+	then
+            if [ -z "$backupvms" ]
+            then
+               	writeout "\033[0;31mThe --backup-vms string is a mandatory value when --backup-type is set to: \033[0m"$backuptype
+        	DO_BACKUP=0
+	    fi
+	fi
+fi
+
+if [ -z "$backupprog" ]
+then
+	backupprog="vmkfstools"
+else
+	if [ "$backupprog" != "vmkfstools" -a "$backupprog" != "rsync" -a "$backupprog" != "xsidiff" -a "$backupprog" != "onediff" -a "$backupprog" != "borg" -a "$backupprog" != "xsitools" ]
+	then
+	    writeout "\033[0;31mThe only accepted values for --backup-prog are vmkfstools | rsync | xsidiff | onediff | borg\033[0m"
+	    DO_BACKUP=0	
+	else
+	    if [ "$backupprog" == "xsitools" ]
+	    then
+	    	ISXSIREPO=$( isXSIRepo "$backuppoint" )
+	    	if [ "$ISXSIREPO" != "1" ]
+	    	then
+	    	    writeout "\033[0;36mWARNING:\033[0m the $backuppoint dir is not an XSITOOLS repo, it will be initialized"
+	    	    drawline	
+	    	fi
+	    fi	
+	fi
+fi
+
+SEND_EMAIL=1
+
+#if [ -z "${subject}" ]
+#then
+#    subject="ESXi Backup Report. More OSS at http://33hops.com/free-open-source-software.html#xsibackup"
+#fi
+
+if [ -z ${mailto} ]
+then
+    SEND_EMAIL=0
+    SEND_EMAIL_MSG=$SEND_EMAIL_MSG"The --mail-to string has not been set$newline"
+fi
+
+if [ "$usesmtp" == "" ]
+then
+
+    if [[ -z ${mailfrom} ]]
+    then
+	SEND_EMAIL=0
+	SEND_EMAIL_MSG="The --mail-from string has not been set$newline"
+    fi
+
+    if [[ -z ${smtpsrv} ]]
+    then
+        SEND_EMAIL=0
+        SEND_EMAIL_MSG=$SEND_EMAIL_MSG"The --smtp-srv string has not been set$newline"
+    fi
+
+    if [[ -z ${smtpport} ]]
+    then
+        SEND_EMAIL=0
+        SEND_EMAIL_MSG=$SEND_EMAIL_MSG"The --smtp-port string has not been set$newline"
+    fi
+
+    if [[ -z ${smtpauth} ]]
+    then
+        smtpauth="plain"
+    elif [ "$smtpauth" = "none" ]
+    then
+	SEND_EMAIL_MSG=$SEND_EMAIL_MSG"The --smtp-auth string has been set to -none-$newline"
+    fi
+
+    if [[ -z ${smtpusr} ]]
+    then
+        if [[ "${smtpauth}" != "none" ]]
+        then
+            SEND_EMAIL=0
+            SEND_EMAIL_MSG=$SEND_EMAIL_MSG"The --smtp-usr string has not been set, you need --smtp-usr if --smtp-auth is other than -none-$newline"
+	fi
+    fi
+
+    if [[ -z ${smtppwd} ]]
+    then
+        if [[ "${smtpauth}" != "none" ]]
+        then
+            SEND_EMAIL=0
+            SEND_EMAIL_MSG=$SEND_EMAIL_MSG"The --smtp-pwd string has not been set, you need --smtp-pwd if --smtp-auth is other than -none-$newline"
+	fi
+    fi
+
+fi
+                
+if [ "${SEND_EMAIL}" -eq "0" ]
+then
+	# NEWCODE
+        echo "E-mail Warnings"
+        drawline
+        writeout "The e-mail report will not be sent because of the followig reasons:$newline$SEND_EMAIL_MSG$newline"
+	drawline
+fi
+
+if [ "${DO_BACKUP}" -eq "0" ]
+then
+        writeout "Error JOBSKIP1: the backup job will be skipped because some mandatory values are missing"
+        ERR JOBSKIP1 "Error: the backup job will be skipped because some mandatory values are missing"
+fi
+
+if [ "$backuproom" -gt "0" ]
+then
+	writeout "The backup room has been limited to $backuproom gb."
+	drawline
+fi
+
+getDatastoreNameByDatastorepath(){
+    for DSE in $(df -h | grep -v Filesystem | awk -F '%' '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g')
+    do
+    	if [ "$( ls -la "$DSE" | grep -E "^l" | grep "$1" | wc -l )" -gt "0" ]
+    	then
+ 	    echo "$DSE"   	    	
+    	fi
+    done
+}
+
+getDatastorepathByDatastorename(){
+    echo $( df | grep -E "/"${2}"$" | awk '{print $NF}' )
+}
+
+avail_backup_room(){
+
+        OLDIFS=$IFS
+        DFRETURN=$( df -m | tail -n +2 )
+        MYPATH=$( getMountedPath "$1" )
+
+        IFS=$newline
+        for line in $DFRETURN
+        do
+        DFPATH=$( echo $line | awk -F '%' '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' )
+        
+        if [ "$DFPATH" == "$MYPATH" ]
+        then
+	    dirs=$(ls -1d "$backuppoint"/$datedirmask 2>/dev/null | wc -l)
+	    if [ $dirs -gt 0 ]
+            then
+            	THEUSED=$( du -scm "$backuppoint"/$datedirmask | grep total | awk '{ print $1 }' )
+            else
+                THEUSED=0
+            fi
+            THEROOM=$( echo $line | awk '{ print $4 }' )
+            if [ "${MYPATH#*$DFPATH}" == "" ]
+            then
+            	break
+            fi
+        fi
+        done
+        IFS=$OLDIFS
+	
+	if [[ -z ${THEROOM} ]]
+	then
+	    echo "-1"	
+	else
+	    if [ "$backuproom" -eq "$backuproom" -a "$backuproom" -gt "0" ] 2>/dev/null
+	    then
+                ASIGNEDMINUSUSED=$(( $backuproom*1024-$THEUSED ))
+                if [ "$ASIGNEDMINUSUSED" -gt "$THEROOM" ]
+                then
+                    echo $THEROOM
+                else
+                    echo "$ASIGNEDMINUSUSED"
+                fi
+	    else	
+		echo $THEROOM
+	    fi
+	fi
+}
+
+get_vm_state(){
+
+        if [ "$2" != "" ]
+        then
+       		IFS=":"
+       		pn=1
+       		for spart in $2
+       		do
+       		    eval "srv"$pn=\""$spart"\"		
+       		pn=$(( $pn+1 ))	
+       		done
+       		IFS=$OLDIFS
+       		
+       		SOUTPUT=$(eval ssh "$SSHOPTS" -p "$srv2" ${defremusr}@"$srv1" exec "vim-cmd vmsvc/power.getstate $1 | grep Powered 2> /dev/null" 2>/dev/null)
+       		SOUTPUT="$( echo "$SOUTPUT" | sed '/FIPS mode initialized/d' )" 
+        else
+        	SOUTPUT=$(vim-cmd vmsvc/power.getstate $1 | grep Powered)
+        fi
+
+        if [ "$SOUTPUT" = "Powered off" ]
+        then
+        	echo "OFF"
+        else
+                echo "ON"
+        fi
+}
+
+make_room(){
+	if [ "$backupprog" == "xsitools" ]
+	then
+	    makeroomhere=$( getMountedPath "$2" )
+	else
+	    makeroomhere="$2"
+	fi
+        OLDIFS=$IFS
+        n=0
+        while [ "$1" -gt "$( avail_backup_room "$makeroomhere" )" ]
+        do
+            	if [ "$n" -gt "10" ]
+                then
+                	available=$( avail_backup_room "$makeroomhere" )
+                	echo "Error MKROOM01: cannot make $(( $1/1024 ))G of room, only $(( $available/1024 ))G can be made available"
+                	ERR MKROOM01 "Error: cannot make $(( $1/1024 ))G of room, only $(( $available/1024 ))G can be made available"
+                	break
+                fi
+                
+                OLDESTDIR=$( find "$makeroomhere"/ -type d -name "$datedirmask" -maxdepth 1 | sort -nr | tail -1 )
+                n=$(( $n+1 ))
+                if [ "$OLDESTDIR" != "" ]
+                then
+                    if [ -d "$OLDESTDIR" ]
+                    then
+                        rm -rf "$OLDESTDIR" 2>/dev/null
+                    	DELDIRS=$DELDIRS"<br>"$OLDESTDIR
+        	    fi
+        	fi
+        done
+        IFS=$OLDIFS
+        echo "$DELDIRS"
+}
+
+getValue(){
+
+        RawData=$( eval $1 )
+
+        IFS=$newline
+        for dataline in $RawData
+        do
+                if [[ ${dataline//$2/} != "$dataline" ]]
+                then
+                        if [[ ${dataline//=/} != "$dataline" ]]
+                        then
+
+                                keyval=$dataline
+
+                                if [[ ${dataline//vmfs/} == "$dataline" ]]
+                                then
+                                keyval=${keyval//-/}
+                                fi
+
+                                keyval=${keyval//\"/}
+                                keyval=${keyval//,/}
+                                keyval=${keyval// /}
+                                keyval=${keyval//:/}
+                                echo $keyval
+                                exit 0
+
+                        elif [[ ${dataline//:/} != "$dataline" ]]
+                        then
+
+                                keyval=$dataline
+                                keyval=${keyval//-/}
+                                keyval=${keyval//\"/}
+                                keyval=${keyval//,/}
+                                keyval=${keyval// /}
+                                keyval=${keyval//:/=}
+                                echo $keyval
+                                exit 0
+
+                        else
+
+                                keyval=$dataline
+                                keyval=${keyval//-/}
+                                keyval=${keyval//\"/}
+                                keyval=${keyval//,/}
+                                keyval=${keyval// /}
+                                keyval=`echo $keyval | sed 's/[ \t]\+/ /g'`
+                                keyval=${keyval// /=}
+                                echo $keyval
+                                exit 0
+
+                        fi
+                                exit 0
+
+                fi
+
+        done
+        IFS=$OLDIFS
+
+}
+
+getVMDir(){
+
+        if [ -z "$2" ] || [ $( echo "$2" | grep -oE "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$" | wc -l ) -eq 0 ]
+        then
+            d=$(vim-cmd vmsvc/get.filelayout $1 | grep vmPathName | awk -F '=' '{print $2}' | awk -F ']' '{print $2}' | sed -e 's/\"//g' -e 's/\,//g' -e 's/^ *//g' -e 's/ *$//g')
+            VMDIR=$( dirname "$d" )
+        else
+            if [ "$3" -eq "$3" ]2>/dev/null
+            then
+                port="$3"
+            else
+                port="22"
+            fi
+  	    VMDIR=$(eval ssh "$SSHOPTS" -p "$3" ${defremusr}@"$2" "vim-cmd vmsvc/get.filelayout $1 | grep vmPathName | awk -F '=' '{print \$2}' | awk -F '\]' '{print \$2}' | sed -e 's/\"//g' -e 's/\,//g' -e 's/^ *//g' -e 's/ *$//g'" 2>/dev/null) 
+            VMDIR="$( echo "$VMDIR" | sed '/FIPS mode initialized/d' )"
+	fi
+	echo "$VMDIR"
+
+}
+
+getVMName(){
+
+        if [ -z "$2" ] || [ $( echo "$2" | grep -oE "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$" | wc -l ) -eq 0 ]
+        then
+            VMNAME=$( vim-cmd vmsvc/get.config $1 | grep name | head -n1 | awk -F '=' '{print $2}' | awk -F ',' '{print $1}' | sed -e 's/^ *//g' -e 's/ *$//g' -e 's/\"//g' )
+        else
+            if [ "$3" -eq "$3" ] 2>/dev/null
+            then
+            	port="$3"
+            else
+            	port="22"
+            fi
+            VMNAME=$( eval ssh "$SSHOPTS" -p "$3" ${defremusr}@"$2" "vim-cmd vmsvc/get.config $1 | grep name | head -n1 | awk -F '=' '{print \$2}'| awk -F '\,' '{print \$1}'| sed -e 's/^ *//g' -e 's/ *$//g' -e 's/\"//g'" 2>/dev/null )
+            VMNAME="$( echo "$VMNAME" | sed '/FIPS mode initialized/d' )"
+	fi
+        echo "$VMNAME"
+        
+}
+
+getVMXDir(){
+
+    vmid=$1
+    dss=$( vim-cmd vmsvc/getallvms | awk '$1=='$vmid | awk -F '[' '{print $2}' | awk -F ']' '{print $1}' )
+    fps=$( vim-cmd vmsvc/getallvms | awk '$1=='$vmid | awk -F ']' '{print $2}' | awk -F '.vmx' '{print $1.vmx}' | sed -e 's/^ *//g' -e 's/ *$//g' )
+    theVMXFilePath="/vmfs/volumes/$dss/$fps"
+    theVMXDir=$( dirname "$theVMXFilePath" )
+    if [ -d "$theVMXDir" ]
+    then
+        echo "$theVMXDir"
+    else
+        $( ERR $? "Error getting the VMX dir for VM: $vmid. You might have deleted the VM files, but the VM is still registered." )
+    fi
+
+}
+
+getVMDatastoresById(){
+    DSs="$( vim-cmd vmsvc/get.filelayout $1 | grep -E '^[ \t].*\"\[.*.vmdk.*' | awk -F'[][]' '{print $2}' | sort -u )"
+    echo "$DSs"	
+}
+
+getVMFoldersById(){
+    vmFolders="$( vim-cmd vmsvc/get.filelayout $1 | grep -E '^[ \t].*\"\[.*.vmdk.*' | sed -e 's/\"//g' -e 's/\,//g' -e 's/\[//g' -e 's/\] /\//g' | awk '{print $0}' | sed -e 's/^ *//g' -e 's/ *$//g' | awk '{print "/vmfs/volumes/"$0}' | awk -F '/' 'sub(FS $NF,x)' | sort -u )"
+    echo "$vmFolders"
+}
+
+getVMDiskExclusions(){
+    vmname="$( getVMName $1 )"
+    IFS=","
+    for evm in $backupvms
+    do
+        evmn="$( echo "$evm" | awk -F '!' '{print $1}' )"
+        exvm="$( echo "$evm" | awk -F '!' '{print $2}' )"
+        if [ "$evmn" == "$vmname" -a "$exvm" != "" ]
+        then
+            vmdk2exclude="$exvm"
+        fi
+    done
+    IFS=$OLDIFS
+    echo "${vmdk2exclude//.vmdk/}"
+}
+
+isDiskExcluded(){
+    vmdk2exclude="$( getVMDiskExclusions $1 )"
+    echo "$( echo "$vmdk2exclude" | awk -F ';' -v a="(-[0-9]{6})?(-flat|-sesparse|-delta)?.vmdk" -v b="$2" '{for(i=1;i<=NF;i++){if(b~$i a){print $i}}}' | wc -l )"
+}
+
+getVMSize(){
+        realsize="0"
+        aparentsize="0"
+	diskpaths=$(getAllFiles $1)
+	if [ "$diskpaths" != "" ]
+	then
+	    FILES=""
+            IFS=$newline
+            for disk in $diskpaths
+            do
+                path="$( echo "$disk" | awk -F '=' '{print $2}' )"
+                path=${path//\"/}
+                diskname="$( basename "$path" )"
+                if [ "$( isDiskExcluded $1 "$diskname" )" -eq "0" ]
+                then
+                    if [ -f "$path" ]
+                    then
+                        FILES="${FILES}${path};"
+                        vmdksize=$( du -ms "$path" | awk '{print $1}' )
+                        aparentb=$( ls -la "$path" | awk '{print $5}' )
+                        aparentm=$(( $aparentb/1024/1024 ))
+                    else
+                        vmdksize=0
+                    fi
+                    realsize=$(( $realsize+$vmdksize ))
+                    disksize=$(( $disksize+$aparentm ))
+                fi
+            done
+            IFS=$OLDIFS
+	    if [ "$realsize" -eq "$realsize" ] 2>/dev/null
+	    then
+	        realsize=$realsize
+	    else
+	    	realsize=0
+	    fi
+            if [ "$aparentsize" -eq "$aparentsize" ] 2>/dev/null
+            then
+                aparentsize=$disksize
+            else
+                aparentsize=0
+            fi
+	    echo "$realsize"-"$aparentsize"		
+	else
+	    echo "null-null"
+	fi
+    }
+
+killLeftovers(){
+
+        if [ "$1" != "" ]
+        then
+            if [ "$2" != "" ]
+            then
+            	sshport="$2"
+            else
+                sshport="22"
+            fi
+            REMPIDS=$( eval ssh -o StrictHostKeyChecking=no -i "${PWD}"/xsibackup_id_rsa -p "$sshport" ${defremusr}@"$1" exec "pkill -9 xsibackup-rsync 2>/dev/null && pkill -9 pv 2>/dev/null && pkill -9 xsidiff 2>/dev/null" 2>/dev/null )
+            REMPIDS="$( echo "$REMPIDS" | sed '/FIPS mode initialized/d' )"
+	else
+            RSPID=$( pkill -9 xsibackup-rsync 2>/dev/null && pkill -9 pv 2>/dev/null)
+        fi
+}
+
+if [ "$REMOTEOS" == "vmkernel" ]
+then
+    killLeftovers
+fi
+
+compSizes(){
+
+        s1=${1// /\ }
+        s2=${2// /\ }
+
+        if [ -f "$s1" ]
+        then
+                size1=$( ls -las "$s1" 2> /dev/null | awk -F " " '{print $1}' )
+        else
+                size1=""
+                writeout "\033[0;31mError CMPSIZ01: the file ${s1} does not exist\033[0m"
+                ERR CMPSIZ01 "Error: the file ${s1} does not exist"
+        fi
+
+        if [ -f "$s2" ]
+        then
+                size2=$( ls -las "$s2" 2> /dev/null | awk -F " " '{print $1}' )
+        else
+                IFS=":"
+                s=1
+                for spart in $s2
+                do
+                        eval "srv"$s=\""$spart"\"
+                s=$(($s+1))
+                done
+                IFS=$OLDIFS
+
+                size2=$( eval ssh "$SSHOPTS" -p "$srv2" ${defremusr}@"$srv1" "ls -las \"${srv3// /\ }\"" 2>/dev/null )
+                size2="$( echo "$size2" | sed '/FIPS mode initialized/d' )"
+		size2=$( echo "$size2" | awk '{print $1}')
+        fi
+
+        if [ "$size1" -eq "$size2" ]
+        then
+                echo "1"
+        else
+                echo "0"
+        fi
+}
+
+getTopVmdks(){
+    snapshots=$( cat "$( getVMXDir $1 )/"*.vmsd )
+    IFS=$newline
+    for eachsnap in $snapshots
+    do
+        if [ ${eachsnap//displayName/} != ${eachsnap} ]
+        then
+                eval $( echo ${eachsnap// /} | awk -F '.' '{for (i=2; i<=NF; i++) print $i}' )
+        fi
+        if [ ${eachsnap//uid/} != ${eachsnap} ]
+        then
+                eval $( echo ${eachsnap// /} | awk -F '.' '{for (i=2; i<=NF; i++) print $i}' )
+        fi
+        if [ "$displayName" == "xsibackup" ]
+        then
+        	if [ ${eachsnap//numDisks/} != ${eachsnap} ]
+        	then
+                	eval $( echo ${eachsnap// /} | awk -F '.' '{for (i=2; i<=NF; i++) print $i}' )
+                	topsnapshot=$( echo ${eachsnap// /} | awk -F '.' '{print $1}' )
+			theuid=$uid
+        	fi
+        fi
+    done
+    IFS=$OLDIFS
+    theDisks=""
+    for j in $( seq 0 $(( $numDisks-1 )) )
+    do
+        theDisk=$( echo "$snapshots" | grep "${topsnapshot}.disk$j.fileName" | awk -F '=' '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' )
+        theNode=$( echo "$snapshots" | grep "${topsnapshot}.disk$j.node" | awk -F '=' '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' )
+        theDisks=${theDisks}${newline}${theNode//\"/}".fileName = "${theDisk}
+	#theDisks=${theDisks}${newline}${theDisk}
+    done
+    if [ "$2" == "id" ]
+    then
+	echo "$theuid"
+    else
+	echo "$theDisks"
+    fi
+}
+
+deleteSnapshot(){
+    if [ "$(get_vm_state $1)" == "ON" ]
+    then
+    	# Get last snapshot id
+    	lastId=$( vim-cmd vmsvc/snapshot.get $1 | grep Id | awk -F ':' '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' | tail -n1 )
+    	if [ "$lastId" == "$( getTopVmdks $1 id )" ] && [ "$lastId" != "" ]  
+    	then
+	    delSna=$( vim-cmd vmsvc/snapshot.remove $1 $lastId false )
+    	fi
+    fi
+}
+
+getAllFiles(){
+    gFolders="$( getVMFoldersById $1 )"
+    if [ "$gFolders" != "" ]
+    then
+    	IFS=$newline
+    	for folder in $gFolders
+    	do
+	    for fvmdk in "$folder"/*.vmdk
+	    do
+	    	if [ -f "$fvmdk" ]
+	    	then
+	    	    echo "DISK=${fvmdk}"
+	    	fi		
+	    done
+	    for fvmsn in "$folder"/*.vmsn
+	    do
+	    	if [ -f "$fvmsn" ]
+	    	then
+	    	    echo "DISK=${fvmsn}"
+	    	fi	  	
+	    done	
+    	done
+    	IFS=$OLDIFS
+    fi
+}
+
+isFileOpen(){
+    tail -c1 "$1" &>/dev/null;echo "$?"
+}
+
+getSnapshotIdByName(){
+	# $1 => Snapshot Name
+	# $2 => .vmsd path
+	SNAPORD=$( grep ".displayName = \"$1\"" "$2" | awk -F "." '{print $1}' )
+	SNAPID=$( grep "${SNAPORD}.uid" "$2" | awk -F "=" '{print $2}' | sed 's/\"//g' | sed 's/\ //g' )
+	echo "$SNAPID"
+}
+
+getSnapshotFilesById(){
+        # $1 => Snapshot Id
+        # $2 => .vmsd path
+
+	vmsddir="$( dirname "${2}" )"
+        
+        IS_SNAPSHOT_FRAGMENTED=$( grep -E "snapshot0.disk0.fileName = \".+[0-9]{6}\.vmdk\"" "$2" | sed 's/\"//g' | wc -l )
+
+        snf=$( grep "uid = \"$1\"" "$2" | awk -F "." '{print $1}' )
+        snf1=$( grep ${snf}.filename "$2" | awk -F "=" '{print $2}' | sed 's/\"//g' )
+        snf=$( grep "parent = \"$1\"" "$2" | awk -F "." '{print $1}' | sed 's/snapshot//g' )
+        snf2=$( grep -E snapshot${snf}.disk[0-9]+.fileName "$2" | grep .vmdk | awk -F "=" '{print $2}' | sed 's/\"//g' )
+        snf3=${snf2//.vmdk/-delta.vmdk}
+        snf4=${snf2//.vmdk/-sesparse.vmdk}
+
+        if [ "$IS_SNAPSHOT_FRAGMENTED" == "1" ]
+        then
+            snn=$( grep "uid = \"$1\"" "$2" | awk -F "." '{print $1}' )
+	    snfArr=$( grep "${snn}.disk[0-9].fileName = " "$2" | awk -F " = " '{print $2}' | sed 's/\"//g' )
+	    snn02=$( echo "$snfArr" | head -n1 | awk -F '-' '{print $NF}' | sed -r 's/.vmdk|0//g' )
+	    snn01=$(( $snn02-1 ))
+	    nend=$( printf "%06d" "$snn01" )	
+            IFS=${newline}
+	    sdn=0
+	    for sndsk in $snfArr 
+	    do
+		sndsk2=$( echo "$sndsk" | sed -r "s/-[0-9]{6}/-${nend}/g" )
+		if [ "$( echo "$sndsk" | awk -F '.' '{print $NF}' )" == "vmdk" ]
+		then
+		    deltaf="${sndsk//.vmdk/-delta.vmdk}"
+		    deltaf2=$( echo "$deltaf" | sed -r "s/-[0-9]{6}/-${nend}/g" )
+		    sespaf="${sndsk//.vmdk/-sesparse.vmdk}"
+		    sespaf2=$( echo "$sespaf" | sed -r "s/-[0-9]{6}/-${nend}/g" )			
+		fi
+		output="${output}${sndsk}${newline}${sndsk2}${newline}${deltaf}${newline}${deltaf2}${newline}${sespaf}${newline}${sespaf2}${newline}"	
+	    sdn=$(( $sdn+1 ))
+	    done
+	    IFS=$OLDIFS
+            manifest=$( ls -1 "$vmsddir"/*manifest*.zip 2>/dev/null )
+            if [ -f "$manifest" ]
+            then
+            	manifest=$( basename "$manifest" )
+                output="${output}${manifest}${newline}"
+	    fi
+	    output=$(echo "$output" | sed '$d')	    
+        else
+            output="$snf1"${newline}"$snf2"${newline}"$snf3"${newline}"$snf4"${newline}
+        fi
+
+        IFS=$newline
+        for snaplin in $output
+        do
+            snapl=$(echo "${snaplin}" | sed -e 's/^ *//g' -e 's/ *$//g' )
+            if [ "${snapl:0:1}" = "/" ]
+            then
+                if [ -f "${snapl}" ]
+                then
+                    spout="${spout}${snapl}"${newline}
+                fi
+            else
+                snaplp="$(echo ${snapl} | sed -e 's/^ *//g' -e 's/ *$//g' )"
+                if [ -f "${vmsddir}"/"${snaplp}" ]
+                then
+                    spout="${spout}${vmsddir}"/"${snaplp}"${newline}
+                fi
+            fi
+        done
+        IFS=$OLDIFS
+        spout=$(echo "$spout" | sed '$d')
+        echo "$spout"
+}
+
+replaceAbsolutePaths(){
+	if [ -f "$1" ]
+	then
+		filecontent=$( cat "$1" )
+		filecontent="$filecontent"	
+	else
+		filecontent="$1"
+	fi
+	abspath="0"
+	newfilecontent=""
+	IFS=$newline
+	for fileline in $filecontent
+	do
+	    if [ "${fileline/sched.swap.derivedName/}" == "${fileline}" ]
+	    then
+		value=$( echo "$fileline" | awk -F "=" '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' | sed 's/\"//g' )
+		if [ "${value:0:1}" = "/" ]
+		then
+			newvalue=$( basename "$value" )
+			#newfileline="${fileline//$value/$newvalue}"
+			newfileline=$( echo "$fileline" | sed "s|$value|$newvalue|g" )
+			newfileline="$newfileline"
+			abspath="1"
+		else
+			newfileline="$fileline"
+		fi
+		newfilecontent="${newfilecontent}${newfileline}"$newline	
+	    fi
+	done
+	IFS=$OLDIFS
+	if [ "$abspath" = "1" ]
+	then
+		echo "$newfilecontent"
+	else
+		echo "$filecontent"
+	fi
+}
+
+check_hwver(){
+    hwvko=0
+    if [ "$1" == "5.1.0" ]
+    then
+        if [ "$2" -gt "9" ]
+        then
+            hwvko=1
+            writeout "\033[0;31mALERT: you are backing up a VM with hardware version $2 to ESXi $1\033[0m"
+            writeout "\033[0;31mThis is not going to work, please read about HW versions and ESXi\033[0m"
+            drawline
+        fi
+    elif [ "$1" == "5.5.0" ]
+    then
+        if [ "$2" -gt "10" ]
+        then
+            hwvko=1
+            writeout "\033[0;31mALERT: you are backing up a VM with hardware version $2 to ESXi $1\033[0m"
+            writeout "\033[0;31mThis is not going to work, please read about HW versions and ESXi\033[0m"
+            drawline
+        fi
+    elif [ "$1" == "6.0.0" ]
+    then
+        if [ "$2" -gt "11" ]
+        then
+            hwvko=1	
+            writeout "\033[0;31mALERT: you are backing up a VM with hardware version $2 to ESXi $1\033[0m"
+            writeout "\033[0;31mThis is not going to work, please read about HW versions and ESXi\033[0m"
+            drawline
+        fi
+    elif [ "$1" == "6.5.0" ]
+    then
+        if [ "$2" -gt "13" ]
+        then
+            hwvko=1
+            writeout "\033[0;31mALERT: you are backing up a VM with hardware version $2 to ESXi $1\033[0m"
+            writeout "\033[0;31mThis is not going to work, please read about HW versions and ESXi\033[0m"
+            drawline
+        fi
+    fi
+    if [ "$hwvko" == "1" ]
+    then
+	ERR HWVMISTM "Error: hardware version incompatibility, details: HW version is $2 while ESXi version is $1"    	
+    fi
+}
+
+if [ -f "$PWD"/src/onediff ]
+then
+    . "$PWD"/src/onediff
+fi
+
+cloneVM(){
+
+        if NAM="$( getVMName $1)"
+        then
+            cloneMsg="VM name: $NAM\n"
+        else
+            writeout "\033[0;31mError CLVMNAM1: error getting VM name for VM Id: $1\033[0m"
+            ERR CLVMNAM1 "Error getting VM name for VM Id: $1"
+        fi
+
+        VMPID=$( ps | grep "$NAM" | awk '{print $2}' | head -n1 )
+
+	if [ "$4" == "rsync" -o "$4" == "xsidiff" -o "$4" == "vmkfstools" -o "$4" == "borg" ]
+	then
+	    oldbakprog="$backupprog"
+	    backupprog="$4"	
+	fi
+	
+	writeout "Removing snapshots, please wait..."
+	drawline
+	DELSNAPSHOT=$( (deleteSnapshot $1) 2>&1 )
+        if [ "$DELSNAPSHOT" != "" ]
+        then
+            writeout "\033[0;31mError CLDELSN1: cannot delete snapshot VM Id: $1, details: $DELSNAPSHOT\033[0m"
+            ERR CLDELSN1 "Error: cannot delete snapshot VM Id: $1, details: $DELSNAPSHOT"
+        fi
+        
+        writeout "Syncronizing config files"
+        drawline
+        
+        VMXDir="$( getVMXDir $1 )"
+        if [ "$VMXDir" != "" ]
+        then
+            cloneMsg="VMX file directory: \"$VMXDir\"\n"
+        else
+            writeout "\033[0;31mError CLVMXDIR: error getting VMX file directory for: $NAM\033[0m"
+            ERR CLVMXDIR "Error getting VMX file directory for: $NAM"
+        fi
+
+	VMXFILEPATH="$( ls -1 "$VMXDir/"*".vmx" 2>&1 )"
+	if [ ! -f "$VMXFILEPATH" ]
+	then
+	    writeout "\033[0;31mNo .vmx config file found for $NAM ($1)\033[0m"
+	    ERR CLVMXFIL "No .vmx config file found for $NAM ($1)"	    
+	fi
+
+	# Get HW version
+	HWVer="$( cat "$VMXFILEPATH" | grep "virtualHW.version" | awk -F '=' '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' -e 's/\"//g' )"
+	if [ "$REMESXiVers" != "" ]
+	then
+	    check_hwver "$REMESXiVers" "$HWVer"
+	fi 
+
+	VMXFILEDIR="$( dirname "$VMXFILEPATH" )"
+	VMXFILENAME="$( basename "$VMXFILEPATH" )"
+
+	VMSDFILEPATH="$( ls -1 "$VMXDir/"*".vmsd" 2>&1 )"
+	if [ ! -f "$VMSDFILEPATH" ]
+	then
+	    writeout "\033[0;31mNo .vmsd file found for $NAM ($1)\033[0m"
+	    ERR CLVMSDPA "No .vmsd file found for $NAM ($1)"
+	fi
+	VMSDFILEDIR="$( dirname "$VMSDFILEPATH" )"
+	VMSDFILENAME="$( basename "$VMSDFILEPATH" )"
+
+	VMXFFILEPATH="$( ls -1 "$VMXDir/"*".vmxf" 2>&1 )"
+	VMXFFILENAME="$( basename "$VMXFFILEPATH" )"
+	if [ "$errverb" -gt "2" ]
+	then
+	    if [ ! -f "$VMXFFILEPATH" ]
+	    then
+	    	VMXFFILEPATH=""
+	    	writeout "\033[0;36mNo .vmxf file found for $NAM ($1)\033[0m"
+	    	drawline
+	    	ERR CLVMXFPA "No .vmxf file found for $NAM ($1)" "W"
+	    fi
+	fi
+	NVRAMFILEPATH="$( ls -1 "$VMXDir/"*".nvram" 2>&1 )"
+	NVRAMFILENAME="$( basename "$NVRAMFILEPATH" )"
+	if [ "$errverb" -gt "2" ]
+	then
+	    if [ ! -f "$NVRAMFILEPATH" ]
+	    then
+	    	NVRAMFILEPATH=""
+	    	writeout "\033[0;36mNo .nvram file found for $NAM ($1)\033[0m"
+	    	drawline
+	    	ERR CLNVRAMP "No .nvram file found for $NAM ($1)" "W"
+	    fi
+        fi
+        
+        VMD="$( getVMDir $1 )"
+        if [ "$VMD" != ""  ]
+	then
+	    cloneMsg="\033[0;36mVM directory:\033[0m $VMD\n"
+	else
+	    writeout "Error getting VM directory for [$1]"
+	    ERR CLVMDIR1 "Error getting VM directory for [$1]"
+	fi
+
+	VMXFILECONTENT="$( cat "$VMXFILEPATH" )"
+	VMSDFILECONTENT="$( cat "$VMSDFILEPATH" )"
+
+	if [ "$SERVERTYPE" = "DIR" ]
+	then
+        	if [ "$datedir" = "yes" ]
+        	then
+                    thedir="$2"/"$newdirmask"/"$NAM"
+        	else
+                    thedir="$2"/"$NAM"
+        	fi
+
+                # Delete remote dir
+		# The rmremdir function will detect whether the 
+		# :F (full) option has been parsed
+		rmremdir "${thedir}" $backsrvtrf
+		
+		if [ -d "$thedir" ]
+        	then
+                    if [ "$backupprog" = "vmkfstools" ]
+                    then
+                	rm -rf "$thedir/"*
+        	    fi
+        	else
+                    MKDIRRESP="$( mkdir -p "$thedir" 2>&1 )"
+        	fi
+	
+		td=0	
+		while [ ! -d "$thedir" ]
+		do
+		    writeout "[$NAM] warning: waiting for the backup dir [$thedir] to be created. Consider disabling async NFS"
+		    drawline
+		    if [ "$td" -gt "9" ]
+		    then
+		    	writeout "[$NAM] error: the dir [$thedir] cannot be created, giving up. Details: $MKDIRRESP"
+			ERR CLMKDIR0 "[$NAM] error: the dir [$thedir] cannot be created, giving up. Details: $MKDIRRESP"		    	
+		    	drawline
+		    fi	
+		td=$(( $td+1 ))
+		done
+		
+		if [ -f "$VMXFILEPATH" ]
+		then
+		    VMXFILECONTENT="$( replaceAbsolutePaths "${VMXFILECONTENT}" )"
+		    echo "$VMXFILECONTENT" > "$thedir"/"$VMXFILENAME"
+		fi
+                if [ -f "$VMSDFILEPATH" ]
+                then
+                    VMSDFILECONTENT="$( replaceAbsolutePaths "${VMSDFILECONTENT}" )"
+                    echo "$VMSDFILECONTENT" > "$thedir"/"$VMSDFILENAME"
+                fi		
+		if [ -f "$VMXFFILEPATH" ]
+		then
+		    cp "$VMXFFILEPATH" "$thedir"
+		fi
+		if [ -f "$NVRAMFILEPATH" ]
+		then
+		    cp "$NVRAMFILEPATH" "$thedir"
+		fi
+		
+	elif [ "$SERVERTYPE" = "NET" ]
+	then	
+		if [ "$datedir" = "yes" ]
+                then
+                    thedir="$2"/"$newdirmask"/"$NAM"
+                else
+                    thedir="$2"/"$NAM"
+                fi
+
+                # Delete remote dir
+                # The rmremdir function will detect whether the
+                # :F (full) option has been parsed
+                rmremdir "${thedir}" $backsrvtrf
+
+		if [ "${backupprog//borg/}" == "${backupprog}" ]
+		then                
+                    LS=$(eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" exec "ls -lad \"${thedir// /\ }\" 2>/dev/null" 2>/dev/null)
+                    LS="$( echo "$LS" | sed '/FIPS mode initialized/d' )"
+		    if [ "${LS:0:1}" != "" -a "${LS:0:1}" != "d" ]
+                    then
+                    	writeout "\033[0;36m[$NAM] info: found file having name of VM dir, deleting file...\033[0m"
+                    	RM=$(eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" exec "rm -rf \"${thedir}\" 2>&1" 2>/dev/null)
+                    	RM="$( echo "$RM" | sed '/FIPS mode initialized/d' )"
+			if [ "$RM" != "" ]
+                    	then
+                            writeout "\033[0;31m[$NAM] error CLRMREM2: could not delete remote file ${thedir}, details: $RM\033[0m"
+                            drawline
+                            ERR CLRMREM2 "[$NAM] error: could not delete remote dir ${thedir}, details: $RM"
+                      	fi
+                    fi
+                    LS=$(eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" exec "ls -lad \"${thedir// /\ }\" 2>/dev/null | wc -l" 2>/dev/null)
+                    LS="$( echo "$LS" | sed '/FIPS mode initialized/d' )"
+		    if [ "${LS}" == "0" ]
+                    then
+                        CR=$(eval ssh "$SSHOPTS" -p $baksrvport ${defremusr}@"$baksrvaddr" exec "mkdir -p \"${thedir//\ /\\ }\" 2>&1" 2>/dev/null)
+			CR="$( echo "$CR" | sed '/FIPS mode initialized/d' )"
+			if [ "${CR}" != "" ]
+                        then
+                            ERR CLCRDIR1 "[$NAM] error: not allowed to create dir, details: ip($baksrvaddr), port($baksrvport), opts($SSHOPTS). $CR"
+                        else
+                            writeout "[$NAM] info: created dir to host VM backup"
+                            drawline
+                        fi
+                    fi
+		fi
+
+		if [ -f "$VMXFILEPATH" ]
+		then
+			VMXFILECONTENT="$( replaceAbsolutePaths "${VMXFILECONTENT}" )"
+			if [ "$backupprog" == "rsync" -o "$backupprog" == "xsidiff" ]
+			then
+			    CPVMXCONT="$( ( echo "$VMXFILECONTENT" | eval ssh $SSHOPTS -p"$baksrvport" ${defremusr}@"$baksrvaddr" "cat \> \"${thedir//\ /\\ }/${VMXFILENAME//\ /\\ }\"" ) 2>&1 )"
+			    CPVMXCONT="$( echo "$CPVMXCONT" | sed '/FIPS mode initialized/d' )"
+			elif [ "$backupprog" == "borg" ]
+			then
+			    CPVMXCONT="$( echo "$VMXFILECONTENT" > "/tmp/$VMXFILENAME" )"		
+			    TOCOPY="\"/tmp/$VMXFILENAME\""	
+			fi
+			if [ "$CPVMXCONT" != "" ]
+			then
+			    writeout "\033[0;31m[$NAM] error: cannot copy VMX file, details: $CPVMXCONT\033[0m"
+			    drawline
+			    ERR CLCPNVMX "[$NAM] error: cannot copy VMX file, details: $CPVMXCONT"	
+			else
+			    writeout "[$NAM] info: VMX file succesfully queued"
+			fi	
+		fi
+
+		if [ -f "$VMSDFILEPATH" ]
+		then
+			VMSDFILECONTENT="$( replaceAbsolutePaths "${VMSDFILECONTENT}" )"
+                        if [ "$backupprog" == "rsync" ]
+                        then
+                            CPVMSDCONT="$( ( echo "$VMSDFILECONTENT" | eval ssh "$SSHOPTS" -p"$baksrvport" ${defremusr}@"$baksrvaddr" "cat \> \"${thedir//\ /\\ }/${VMSDFILENAME//\ /\\ }\"" ) 2>&1 )"
+                            CPVMSDCONT="$( echo "$CPVMSDCONT" | sed '/FIPS mode initialized/d' )"
+			elif [ "$backupprog" == "borg" ]
+                        then
+                            CPVMSDCONT="$( echo "$VMSDFILECONTENT" > "/tmp/$VMSDFILENAME" )"	
+                            TOCOPY="$TOCOPY \"/tmp/$VMSDFILENAME\""
+                        fi
+                        if [ "$CPVMSDCONT" != "" ]
+                        then
+                            writeout "\033[0;31m[$NAM] error: cannot copy VMSD file, details: $CPVMSDCONT\033[0m"	
+                            ERR CLCPNVMS "[$NAM] error: cannot copy VMSD file, details: $CPVMSDCONT"
+                        else
+                            writeout "[$NAM] info: VMSD file succesfully queued"
+                        fi
+		fi
+		if [ -f "$VMXFFILEPATH" ]
+		then
+		    if [ "$backupprog" == "rsync" ]
+		    then
+			eval scp $SSHOPTS -P$baksrvport "$VMXFFILEPATH" ${defremusr}@"$baksrvaddr":\"${thedir// /\ }\" > /dev/null 2>&1 && writeout "[$NAM] info: VMXF file succesfully queued" || writeout "[$NAM] info: no .vmxf file found" && drawline
+		    elif [ "$backupprog" == "borg" ]
+		    then
+		    	cp "$VMXFFILEPATH" "/tmp/$VMXFFILENAME"
+		    	TOCOPY="$TOCOPY \"/tmp/$VMXFFILENAME\"" 
+		    fi	
+		fi
+
+		if [ -f "$NVRAMFILEPATH" ]
+		then
+		    if [ "$backupprog" == "rsync" ]
+		    then		
+			eval scp $SSHOPTS -P$baksrvport "$NVRAMFILEPATH" ${defremusr}@"$baksrvaddr":\"${thedir// /\ }\" > /dev/null 2>&1 && writeout "[$NAM] info: NVRAM file succesfully queued" || writeout "[$NAM] info: no .nvram file found" && drawline
+		    elif [ "$backupprog" == "borg" ]
+		    then
+		    	cp "$NVRAMFILEPATH" "/tmp/$NVRAMFILENAME"
+		    	TOCOPY="$TOCOPY \"/tmp/$NVRAMFILENAME\""
+		    fi
+		fi
+		drawline
+	fi
+
+	NOTPRES=$( grep ".present = \"FALSE\"" "$VMXFILEPATH" | grep -E "scsi|ide" | awk -F '.' '{print $1}' )
+	if [ "$7" != "" ]
+	then
+	    VMXFILE="$7"
+	    DOSNAPS="0"
+	else
+	    VMXFILE=$( cat "$VMXFILEPATH" )
+	    DOSNAPS="1"
+	fi
+
+	ALLVMDKVMX=$( echo "$VMXFILE" | grep -vE '^\s*(#|$)' | grep .vmdk )
+        if [ "$ALLVMDKVMX" == "" ]
+        then
+            writeout "\033[0;31m[$NAM] error DIFFEXUP: no VMDK disks present, skipping VM, nothing to backup\033[0m"
+            ERR CLNOVMDK "[$NAM] error: no VMDK disks present, skipping VM, nothing to backup, details: $ALLVMDKVMX"
+        fi
+
+	if [ "$NOTPRES" != "" ]
+	then
+	    for exd in $NOTPRES
+	    do
+		ALLVMDKVMX=$( echo "$ALLVMDKVMX" | grep -v $exd )
+	    done	
+	fi
+
+	INDEPENDENTNUM=$( echo "$VMXFILE" | grep ".mode = \"independent-" | wc -l )
+	INDEPENDENTDSK=$( echo "$VMXFILE" | grep ".mode = \"independent-" | awk -F "." '{print $1}' )
+
+	if [ "${backuphow}" != "cold" ] && [ "$6" = "ON" ]
+	then
+	    sm="0"	
+                if [ "${snapshot//includememory/}" != "${snapshot}" ]
+                then
+                    writeout "\033[0;36mMemory will be included in the snapshot\033[0m"
+                    drawline
+                    sm="1"
+                fi		
+		if [ "$INDEPENDENTNUM" -gt "0" ]
+		then
+		    IFS=$newline
+              	    THEEXCLUSIONS2=""
+        	    for inddisk in $INDEPENDENTDSK
+        	    do
+            	    	toexclude=$( echo "$VMXFILE" | grep "$inddisk".fileName | awk -F "=" '{print $2}' | sed 's/\"//g' | sed -e 's/^ *//g' -e 's/ *$//g' )
+            	    	if [ "${toexclude:0:1}" == "/" ]
+            	    	then
+                	    toexclude=$( basename "$toexclude" )
+            	    	fi
+            	    	THEEXCLUSIONS2=${toexclude}";"${THEEXCLUSIONS2}
+            	    	THEEXCLUSIONS2=$( echo "$THEEXCLUSIONS2" | sed 's/;$//')
+            	    	THEEXCLUSIONS3=${toexclude}";"${THEEXCLUSIONS3}
+        	    done
+		    writeout "At least one independent disk was detected" 
+		    if [ "$sm" == "1" ]
+		    then
+		   	writeout "--snapshot=includememory flag removed"
+		   	sm="0"
+		    fi
+		    writeout "\033[0;36mTip: perform a [cold] backup to copy independent disks\033[0m"
+		    drawline
+		    writeout "This independent disks will be excluded:"
+		    drawline
+		    writeout "${THEEXCLUSIONS2//;/\\n}"
+		    drawline
+		fi
+
+		if [ "$DOSNAPS" = "1" ]
+		then	
+		    if [ "$5" = "toolsOk" ]
+		    then
+			qs="0"
+			if [ "$QUIESCEVM" -eq "0" ]
+			then
+			    writeout "[$NAM] info: VMWare Tools detected, taking snapshot QUIESCED(false)..."
+			    writeout "[$NAM] info: set argument --snapshot=doquiesce to quiesce your VMs"
+			    drawline
+			    qs="0"
+			elif [ "$QUIESCEVM" -eq "1" ]
+			then
+                            qs="1"
+			    if [ "$APPNAM" == "XSIBACKUP-FREE" ]
+                            then
+                            	if [ "$( isWindows $1 )" -gt "0" ]
+                            	then
+                                    qs="0"
+                                    QUIESCEVM=0
+                                    up2Pro "Windows quiescing"
+                            	fi
+                            else			    
+			    	writeout "[$NAM] info: VMWare Tools detected, taking snapshot QUIESCED(true)..."
+			    	drawline
+			    fi
+			fi
+			
+			CREATESNAP=$( ( vim-cmd vmsvc/snapshot.create $1 xsibackup "XSIBackup snapshot" $sm $qs ) 2>&1 )
+			if [ "$CREATESNAP" != "Create Snapshot:" ]
+			then
+                	    writeout "\033[0;31m[$NAM] error CLCRESN1: cannot create snapshot, details: $CREATESNAP\033[0m"
+                	    drawline
+                	    ERR CLCRESN1 "[$NAM] error: cannot create snapshot, details: $CREATESNAP"
+                	    if [ "$qs" -eq "1" ]
+                	    then
+                	        writeout "[$NAM] workaround: could not create quiesced snapshot, trying non-quiesced"
+                	        drawline
+                	        CREATESNAP2=$( ( vim-cmd vmsvc/snapshot.create $1 xsibackup "XSIBackup snapshot" $sm 0 ) 2>&1 )
+                	        if [ "$CREATESNAP2" != "Create Snapshot:" ]
+                	        then
+                	       	    writeout "\033[0;36m[$NAM] error CLCRESN2: could not create workaround non-quiesced snapshot either, details: $CREATESNAP2\033[0m"
+                	    	    drawline
+                	    	    ERR CLCRESN2 "[$NAM] error: cannot create workaround non-quiesced snapshot, details: $CREATESNAP2"
+                	        else
+                	    	    QUIESCEMSG="NO (as workaround)"
+                	    	    writeout "\033[0;36m[$NAM] warning CLCRESN3: non-quiesced snapshot taken as a workaround measure\033[0m"
+                	    	    drawline
+                	    	    ERR CLCRESN3 "[$NAM] warning: non-quiesced snapshot taken as a workaround measure, details: $CREATESNAP2" W	
+                	        fi
+                	    fi
+			fi
+		    else
+			writeout "[$NAM] info: VMWare tools were not detected, the system will not be quiesced"
+			drawline
+			CREATESNAP=$( ( vim-cmd vmsvc/snapshot.create $1 xsibackup "XSIBackup snapshot" $sm 0 ) 2>&1 )
+                        if [ "$CREATESNAP" != "Create Snapshot:" ]
+                        then
+                            ERR CLCRESN2 "[$NAM] error: cannot create snapshot, details: $CREATESNAP"
+                        fi
+		    fi
+		fi
+		
+		CURRSTATE3=$( get_vm_state $1 )
+		if [ "$backuphow" == "warm" -a "$VMSTAT" == "ON" ]
+		then
+		    if [ "$CURRSTATE3" == "OFF" ]
+		    then
+			POWRTN="$( vim-cmd vmsvc/power.on $1 )"
+			if [ "$POWRTN" != "Powering on VM:" ]
+			then
+			    writeout "\033[0;31m[$NAM] error POWONCL1: cannot power on VM\033[0m"
+			    drawline
+			    ERR POWONCL1 "[$NAM] error: cannot power on, details: $POWRTN"
+			else
+			    writeout "[$NAM] info: bringing VM up again"
+			    drawline
+			fi
+		    fi
+		fi
+
+                # Now lets exclude the snapshots the VM is running on when we make an IP Rsync backup
+                if [ "$SERVERTYPE" = "NET" ]
+                then
+                    LOCKEDDISKS=$( cat "$VMXFILEPATH" | grep -E [-][0-9]{6}.vmdk | awk -F "=" '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' -e 's/\"//g' )
+                    IFS=$newline
+                    for lckdisk in $LOCKEDDISKS
+                    do
+                        toexclude=$( basename "$lckdisk" )
+                        delta2exclude="${toexclude//.vmdk/-delta.vmdk}"
+			delta3exclude="${toexclude//.vmdk/-sesparse.vmdk}"
+			THEEXCLUSIONS2=${toexclude}";"${delta2exclude}";"${delta3exclude}";"${THEEXCLUSIONS2}
+                    done
+                fi
+	fi
+
+	if [ "$backupprog" == "rsync" -o "$backupprog" == "xsidiff" -o "$backupprog" == "borg" -o "$backupprog" == "xsitools" ]
+	then
+	    VMDKLIST=ALL
+	    ALLVMDK="$( getAllFiles $1 )"
+	    ALLVMDK="$( echo "$ALLVMDK" | grep -v "\-flat.vmdk" )"
+	else
+	    if [ "$backuphow" = "cold" -o "$6" = "OFF" -o "$DOSNAPS" = "0" ]
+	    then
+		VMDKLIST=VMX
+		ALLVMDK=$ALLVMDKVMX
+	    else
+		VMDKLIST=TOP
+		ALLVMDK=$( getTopVmdks $1 )	
+	    fi	
+	fi
+
+	# Detect if there are any Windows duplicate snapshots
+	if [ "$oldbakprog" == "vmkfstools" -a "$QUIESCEVM" -eq "1" -a "$( echo "$VMOS" | awk '{print tolower($0)}' | grep "^win.*64.*" | wc -l )" -eq "1" ]
+	then
+    	    histsn=$( grep -E "snapshot[0-9].disk[0-9]{1,2}.fileName = \".+[0-9]{6}\.vmdk\"" "$VMSDFILEPATH" | awk -F ' = ' '{print $1}' | awk -F '.' '{print $1}' | sed 's/\"//g' | sort -u | tail -n1 )
+	    topsnp=$( grep -E "${histsn}.disk[0-9]{1,2}.fileName = \".+[0-9]{6}\.vmdk\"" "$VMSDFILEPATH" | awk -F ' = ' '{print $1 " = " $2}' | sed 's/\"//g' )
+	    if [ "$topsnp" != "" ]
+	    then 
+	    	if [ "$oldbakprog" == "vmkfstools" ]
+	    	then
+	    	    ALLVMDK="$topsnp"
+		    if [ "$certifybackup" == "yes" ]
+		    then
+		    	certifybackup="no"
+		    	writeout "\033[1;34m[$NAM] CLQNOCER warning: local (c) 64 bit Windows quiesced backups can't be certified on first run\033[0m"
+		    	drawline
+		    	ERR CLQNOCER "[$NAM] warning: quiescing Windows guests is incompatible with --certify-backup=yes option" W		
+	    	    fi
+		    manifest=$( ls -1 "$VMXFILEDIR"/*manifest*.zip 2>/dev/null )
+	    	fi
+	    fi
+	fi
+
+	ALLVMDK=$( echo "$ALLVMDK" | sort -u | sed '/^\s*$/d' )
+
+	THEEXCLUSIONS="${3};${THEEXCLUSIONS2}"
+	THEEXCLUSIONS="$( echo "${THEEXCLUSIONS}" | sort -u | sed -e 's/^;//g' -e 's/;$//g' )"
+
+	if [ "${#THEEXCLUSIONS}" -gt "0" ]
+	then
+	    ALLVMDK2=""
+	    PRINTALLVMDK=""
+	    IFS=$newline
+	    for eachdsk in $ALLVMDK
+	    do
+	    	IFS=";"
+	    	ISEXCLUDED=0
+	    	for excdsk in $THEEXCLUSIONS
+	    	do 
+	    	    #if [ "$( echo "$eachdsk" | grep -E "${excdsk//.vmdk/}(-[0-9]{6})?.vmdk" | wc -l )" -gt "0" ]
+	    	    if [ "$( isDiskExcluded $1 "$eachdsk" )" -gt "0" ]
+	    	    then
+	    	    	ISEXCLUDED=1
+	    	    	PRINTALLVMDK="${PRINTALLVMDK}\e[1m${eachdsk} (excluded)\033[0m\n"
+	    	    fi
+	    	done
+	    	IFS=$newline
+	    	if [ "$ISEXCLUDED" -eq "0" ]
+	    	then
+	    	    ALLVMDK2="${ALLVMDK2}${eachdsk}\n"	
+	    	    PRINTALLVMDK="${PRINTALLVMDK}${eachdsk}\n"
+	    	fi
+	    done
+	    IFS=$OLDIFS
+	    PRINTALLVMDK="$(echo -e "$PRINTALLVMDK" | sed '/^\s*$/d' )"
+	    ALLVMDK="$(echo -e "$ALLVMDK2" | sed '/^\s*$/d' )"
+	else
+	    PRINTALLVMDK=$ALLVMDK	
+	fi
+
+	PRINTALLVMDK="$( echo "$PRINTALLVMDK" | sort -u )"
+
+        writeout "\e[1mBacking up virtual disks...\033[0m"
+        drawline
+	writeout "$PRINTALLVMDK"
+	drawline
+
+	# Substract excluded disks from list
+	if [ "${#THEEXCLUSIONS}" -gt "0" ]
+	then
+	    TODEDUCE=${THEEXCLUSIONS//;/${newline}}
+	else
+	    TODEDUCE="^$"
+	fi
+
+	SOMEDUPDISK=""
+	# get duplicate disks
+	if [ "$backupprog" == "vmkfstools" ]
+	then
+	    SOMEDUPDISK=$( echo "$ALLVMDK" | sed -r 's/-[0-9]{6}.vmdk/.vmdk/g' | grep -v "$TODEDUCE" | awk -F '=' '{print $NF}' | sed -e 's/^ *//g' -e 's/ *$//g' | awk -F '/' '{print "|"$NF}' | sort | uniq -c | awk -F '|' '$1>1{print $2}' )
+	elif [ "$backupprog" == "rsync" -o "$backupprog" == "xsitools" -o "$backupprog" == "xsidiff" -o "$backupprog" == "borg" ]
+	then
+	    SOMEDUPDISK=$( echo "$ALLVMDK" | grep -v "$TODEDUCE" | awk -F '=' '{print $NF}' | sed -e 's/^ *//g' -e 's/ *$//g' | awk -F '/' '{print "|"$NF}' | sort | uniq -c | awk -F '|' '$1>1{print $2}' )
+	fi
+	if [ "${#SOMEDUPDISK}" -gt "4" ]
+	then
+	    writeout "\033[1;34m[$NAM] CLDUPDSK warning: we have detected that there might exist duplicate disks for this VM,\nplease rename your disks so that each one of them has a unique name.\033[0m"
+	    drawline
+	    ERR CLDUPDSK "[$NAM] warning: we have detected that there might exist duplicate disk names for this VM. Ignoring this message might end up in data loss" W
+	fi
+	
+        IFS=$newline
+        for eachdisk in $ALLVMDK
+        do
+            thedisk=""
+            diskname=""
+            EXCLUDEDISK=0
+            if [ "$THEEXCLUSIONS" != "" ]
+            then
+		IFS=';'
+		for exclusion in $THEEXCLUSIONS
+		do
+		    exclstr=${exclusion//.vmdk/}
+		    matchex=$( echo "$eachdisk" | sed -e "s/${exclstr}-*[0-9]*.vmdk//" )
+		    if [ "$matchex" != "$eachdisk" ]
+		    then
+			EXCLUDEDISK=1
+			eachbasedisk=$( echo "$eachdisk" | awk -F "=" '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' )
+			writeout "Disk [$eachbasedisk] excluded"
+			drawline	
+		    fi	
+		done
+		IFS=$OLDIFS
+            fi
+
+            if [ "$EXCLUDEDISK" -eq "0" ]
+            then
+		thedisk=$( echo "$eachdisk" | awk -F '=' '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' )
+                thedisk=${thedisk//\"/}
+
+		origin=""
+		target=""
+		
+                if [ "${thedisk:0:1}" == "/" ]
+                then
+                    if [ -f "$thedisk" ]
+                    then
+                	origin="$thedisk"
+                	target="$thedir"/$( basename "$thedisk" )
+                	diskname=$( echo "$thedisk" | awk -F '/' '{print $NF}' )
+                    else
+                    	thedisk=""
+                    	diskname=""
+                    	ERR CLNORIG1 "[$NAM] error: no origin disk found at: $origin"
+                    fi
+                else
+                    if [ -f "$VMXDir/$thedisk" ]
+                    then    
+                        origin="$VMXDir/$thedisk"
+                        target="$thedir/$thedisk"
+                        diskname=$thedisk
+                    else
+                    	thedisk=""
+                    	diskname=""
+                    	ERR CLNORIG2 "[$NAM] error: no origin disk found at $VMXDir/$thedisk"
+                    fi
+                fi
+                
+                if [ "$SERVERTYPE" = "DIR" ] && [ "$backupprog" = "vmkfstools" ]
+                then
+                    target=$( echo "$target" | sed -r 's/[-][0-9]{6}.vmdk/.vmdk/g' )
+                fi
+
+                if [ "$SERVERTYPE" = "DIR" ]
+                then
+                	if [ -f "$origin" ]
+                	then
+                		exec 16>&1	
+                		if [ "$4" = "rsync" -o "$4" = "xsitools" -o "$4" = "xsidiff" ]
+                		then
+                		    if [ $( isFileOpen "$origin" ) -eq "0" ]
+				    then
+					#BAKOUT=$( ("$PWD/bin/xsibackup-rsync" -rlpDv --progress "$origin" "$target" >&16) 2>&1 )
+					BAKOUT=$( ("$PWD/bin/xsidiff" --source="$origin" --target="$target" >&16) 2>&1 )
+					drawline
+					if [ "$BAKOUT" != "" ]
+					then
+					    writeout "\033[0;31m[$NAM] CLRSYNC1 error: ${BAKOUT}\033[0m" >&16
+                			    ERR CLRSYNC1 "[$NAM] error: rsync error, details: ${BAKOUT}" 
+                			fi
+                		    fi
+				    # And now the eventual flat/delta files
+                		    flatorigin=""
+                		    flatfile=""
+                		    if [ "${origin//.vmdk/}" != "${origin}" -a "${origin//-delta.vmdk/}" == "${origin}" -a "${origin//-flat.vmdk/}" == "${origin}" ]
+                		    then
+                			flatfile="$(grep -ri '\-delta.vmdk\|\-flat.vmdk' "$origin" | cut -d' ' -f 4- )"
+                		    fi
+                		    if [ "$flatfile" != "" ]
+                		    then
+                			flatfile="${flatfile//\"/}"
+                			vmdkfile=$( basename "$origin" )
+                			vmdkdire=${origin//"$vmdkfile"/}
+                			flatorigin="$vmdkdire""$flatfile"
+                			flattarget="$thedir"/"$flatfile"
+                		    fi
+				    if [ "$flatorigin" != "" ]
+				    then					      
+				      if [ -f "$flatorigin" ]
+				      then	               			
+                			if [ "$( isFileOpen "$flatorigin" )" -eq "0" ]
+                			then
+                			    checkAlign "$flatorigin"
+					    #drawline	                			    
+					    if [ ! -f "$flattarget" ]
+                			    then
+                				rsyncadd1="--whole-file"
+                				rsyncadd2="--sparse"
+                			    else
+                				rsyncadd=""	
+                			    fi
+                			    if [ "$4" == "xsitools" ]
+                			    then
+                			 	if [ "${flatorigin//-flat.vmdk/}" != "${flatorigin}" ]
+                			 	then
+                			 	    targetdir=$( dirname "$flattarget" )
+                			 	    if [ "$blocksize" != "" ]
+                			 	    then
+                			 	    	blocksize=$( echo "$blocksize" | awk '{print toupper($0)}' )
+                			 	    else
+                			 	    	blocksize="auto"
+                			 	    fi
+                			 	    BAKOUT=$( ( xsiTools backup "$flatorigin" "$targetdir" "$blocksize" "$backupprog_options" >&16 ) 2>&1 ) 
+                			            if [ "$?" -eq "33" ]
+                			            then
+                			            	writeout "\033[0;31m[$NAM] XSITBAK1 error: some errors were raised during the XSITools backup\033[0m"
+                			            	ERR XSITBAK1 "[$NAM] error: some errors were raised during the XSITools backup"
+                			            fi	
+                			        else
+                			            if [ "$APPNAM" == "XSIBACKUP-FREE" ]
+                			            then
+                			            	BAKOUT=$( ("$PWD/bin/xsibackup-rsync" -rlpDv --progress "$flatorigin" "$flattarget" >&16) 2>&1 )
+                			            else
+                			            	BAKOUT=$( ("$PWD/bin/xsidiff" --source="$flatorigin" --target="$flattarget" >&16) 2>&1 )
+                			            fi
+                			        fi
+                			        drawline
+                			    else	
+                				if [ "${flatorigin//-flat/}" != "${flatorigin}" ]
+                				then
+                                                    if [ "$APPNAM" == "XSIBACKUP-FREE" ]
+                                                    then
+                                                    	BAKOUT=$( ("$PWD/bin/xsibackup-rsync" -rlpDv --progress $rsyncadd1 $rsyncadd2 "$flatorigin" "$flattarget" >&16) 2>&1 )
+                                                    elif [ "$APPNAM" == "XSIBACKUP-PRO" -a "$LICENSEKEY" -eq "1" ]
+                                                    then
+                                                    	if [ "$4" = "rsync" ]
+                                                    	then
+                                                    	    writeout "\033[0;36m[$NAM] Info: local rsync backups are assumed by (c) XSIDiff as it's much faster\033[0m"
+                                                    	fi                				    
+                				    	BAKOUT=$( ("$PWD/bin/xsidiff" --source="$flatorigin" --target="$flattarget" >&16) 2>&1 )
+                				    else
+                				    	writeout "Alert: your (c) XSIDiff license is not activated, transfer will fall back to Rsync"
+                				    	drawline
+                				    	BAKOUT=$( ("$PWD/bin/xsibackup-rsync" -rlpDv --progress $rsyncadd1 $rsyncadd2 "$flatorigin" "$flattarget" >&16) 2>&1 )
+                				    fi
+                				    drawline
+                			    	fi
+                			    fi	
+                			    if [ "$BAKOUT" != "" ]
+                			    then
+                			        ERR CLXSITO1 "[$NAM] error: backup error, details: ${BAKOUT}"
+                				writeout "\033[0;31m[$NAM] CLXSITO1 error: ${BAKOUT}\033[0m" >&16
+                			    fi	
+                			fi
+                		      fi # flatorigin exists?
+                		    fi # flatorigin not empty  
+                		elif [ "$backupprog" == "vmkfstools" ]
+                		then
+                			if [ -f "$target" ] && [ "$datedir" == "yes" ]
+					then	
+					    target=${target//.vmdk/_1.vmdk}
+					fi
+					if [ -f "$target" ] && [ "$datedir" != "yes" ]
+					then
+					    REMTARGET=$( rm -rf "$target" )
+					    if [ "$REMTARGET" != "" ]
+					    then
+						ERR CLREMTG1 "[$NAM] error: cannot remove target, details: ${REMTARGET}"
+					    fi
+					fi
+					if [ "${origin//.vmdk/}" != "${origin}" -a "${origin//-delta.vmdk/}" == "${origin}" -a "${origin//-flat.vmdk/}" == "${origin}" ]
+					then
+					    flatfile="$(grep -ri '\-delta.vmdk\|\-flat.vmdk' "$origin" | cut -d' ' -f 4- )"
+					fi
+					flatfile="${flatfile//\"/}"
+					flattarget="$thedir"/"$flatfile"
+					if [ -f "$flattarget" ]
+					then
+					    REMFLATTARGET=$( rm -rf "$flattarget" )
+					    if [ "$REMFLATTARGET" != "" ]
+					    then
+						ERR CLREMFTG "[$NAM] error: can't remove remote file, details: ${REMFLATTARGET}"
+					    fi
+					fi
+					if [ "$( echo "$origin" | grep -E ".*(-[0-9]{6}).vmdk" | wc -l )" -gt "0" ]
+					then
+					    if [ "$certifybackup" == "yes" ]
+					    then
+					    	certifybackup="no"
+					    	writeout "[$NAM] warning: the backup cannot be certified as the resulting disk will include some snapshots"
+					    	drawline
+					    	ERR CLCERTN0 "[$NAM] warning: the backup cannot be certified as the resulting disk will include some snapshots" W	
+					    fi	
+					fi			
+					if [ "$( isFileOpen "${origin}" )" -eq "0" ]
+					then
+					    VMKFSTOOLSOUT=""
+					    
+					    ################ VMKFSTOOLS ################
+					    VMKFSTOOLSOUT=$( (vmkfstools -d thin -i "$origin" "$target" >&16) 2>&1 )
+					    ################ VMKFSTOOLS ################
+					    drawline
+					    if [ "$VMKFSTOOLSOUT" != "" ]
+					    then
+						writeout "\033[0;31m[$NAM] CLVMKFS1 error: ${VMKFSTOOLSOUT}\033[0m" >&16
+						drawline
+						ERR CLVMKFS1 "[$NAM] error: vmkfstools error, details: ${VMKFSTOOLSOUT}"
+					    else
+					        writeout "[$NAM] Disk copied to $target"
+					        drawline
+					    fi
+                			else
+                			    VMWARNS="Disk $origin at $NAM is locked by the VM. Persistent or RDM disks can only be -cold- backed up. Exclude $(basename "$origin") from the backup to skip this message."
+                			    writeout "\033[1;31mDisk $origin at $NAM is locked by the VM. Persistent or RDM disks can only be COLD backed up. Exclude $(basename "$origin") from the backup to skip this message.\033[0m" >&16
+                			    ERR CLRDMDK1 "[$NAM] error: disk $origin is locked by the VM, persistent or RDM disks can only be -cold- backed up"
+                			fi
+                			SETBASEDISKS=$( sed -i -r 's/[-][0-9]{6}.vmdk/.vmdk/g' "$thedir"/*.vmx )
+                			if [ "$SETBASEDISKS" != "" ]
+                			then
+                			    writeout "\033[0;31m[$NAM] error CLNREFZO: could not remove [-000000], details: $SETBASEDISKS\033[0m"
+                			    ERR CLNREFZO "[$NAM] error: could not remove [-000000], details: $SETBASEDISKS"
+                			fi
+				fi
+                		exec 16>&-
+                	else
+                		ERR CLNORIG3 "[$NAM] error: no origin disk found at: $origin"
+                	fi
+                
+		elif [ "$SERVERTYPE" = "NET" ]
+		then
+		 if [ -f "$origin" ]	
+		 then
+		   if [ $( isFileOpen "$origin" ) -eq "0" ]
+		   then
+			if [ "$backupprog" == "rsync" -o "$backupprog" == "xsidiff" ]
+			then	
+			    if [ "$REMOTEOS" == "vmkernel" ]
+			    then
+			        # We kill any posible remote xsibackup-rsync process
+                            	K=$( killLeftovers "$baksrvaddr" "$baksrvport" )
+                            	#echo $K
+                            	wait 1					    
+			    fi
+			    LS=$(eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" exec "ls \"${target// /\ }\" | wc -l 2>/dev/null" 2>/dev/null)
+			    LS="$( echo "$LS" | sed '/FIPS mode initialized/d' )"
+			    if [ "$LS" == "0" ]
+			    then
+				writeout "Rsync: transfering file | ${origin}"
+				drawline
+				exec 16>&1	
+                                RSYNCOUT=$( ("$PWD/bin/xsibackup-rsync" -rlpDv --progress --partial --whole-file --rsh="ssh $SSHOPTS -p$baksrvport" --rsync-path="$RMRSYNCPATH" "${origin}" ${defremusr}@$baksrvaddr:"${target}" >&16) 2>&1 )
+                                RSYNCOUT="$( echo "$RSYNCOUT" | sed '/FIPS mode initialized/d' )"
+				exec 16>&-
+                                drawline
+                                if [ "$RSYNCOUT" != "" ]
+                                then
+                                    if [ "${RSYNCOUT//kex protocol error/}" != "${RSYNCOUT}" ]
+                                    then
+                                        writeout "\033[0;31m[$NAM] info: trapped kex protocol error\033[0m"
+                                    else
+                                        writeout "\033[0;31m[$NAM] error CLRSYNC4: ${RSYNCOUT}\033[0m"
+                                        ERR CLRSYNC4 "[$NAM] error: rsync error, details: ${RSYNCOUT}"
+                                    fi
+                                    drawline
+                                fi
+			    else
+				writeout "Rsync: transfering file | ${origin}"
+				drawline
+				exec 16>&1
+				RSYNCOUT=$( ("$PWD/bin/xsibackup-rsync" -rlpDv --progress --partial --rsh="ssh $SSHOPTS -p$baksrvport" --rsync-path="$RMRSYNCPATH" "$origin" ${defremusr}@$baksrvaddr:"${target}" >&16) 2>&1 )
+				RSYNCOUT="$( echo "$RSYNCOUT" | sed '/FIPS mode initialized/d' )"
+				exec 16>&-
+                                drawline
+                                if [ "$RSYNCOUT" != "" ]
+                                then
+                                    if [ "${RSYNCOUT//kex protocol error/}" != "${RSYNCOUT}" ]
+                                    then
+                                        writeout "\033[0;31m[$NAM] info: trapped kex protocol error\033[0m"
+                                    else
+                                        writeout "\033[0;31m[$NAM] error: ${RSYNCOUT}\033[0m"
+                                        ERR CLRSYNC5 "[$NAM] error: rsync error, details: ${RSYNCOUT}"
+                                    fi
+                                    drawline
+                                fi
+			    fi
+			    if [ "$backuphow" == "cold" -a "$( cat "$origin" | grep parentCID=ffffffff | wc -l )" -gt "0" ]
+			    then
+				writeout "Removing unused blocks, please wait..."
+				vmkfstools -K "$origin"
+			    fi
+			elif [ "$backupprog" == "borg" ]
+			then						
+			    TOCOPY="$TOCOPY \"$origin\""
+			fi
+			flatfile=""			
+			if [ "${origin//.vmdk/}" != "${origin}" -a "${origin//-delta.vmdk/}" == "${origin}" -a "${origin//-flat.vmdk/}" == "${origin}" ]
+			then
+			    flatfile="$(grep -ri '\-delta.vmdk\|\-flat.vmdk' "$origin" | cut -d' ' -f 4- )"
+			fi
+			if [ "$flatfile" != "" ]
+			then
+			
+			vmdkdire=$( dirname "$origin" )
+			flatfile=${flatfile//\"/}
+			flatorigin="$vmdkdire"/"$flatfile"
+			flattarget="$thedir"/"$flatfile"
+		
+			if [ -f "$flatorigin" ]
+			then
+			    if [ $( isFileOpen "$flatorigin" ) -eq "0" ]
+			    then	
+			      if [ "$backupprog" == "rsync" -o "$backupprog" == "xsidiff" ]
+			      then
+				LS=$(eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "ls \"${flattarget// /\ }\" | wc -l 2>/dev/null" 2>/dev/null)
+				LS="$( echo "$LS" | sed '/FIPS mode initialized/d' )"
+				if [ "$LS" == "0" -o "$backupprog" == "xsidiff" ]
+				then
+				    writeout "Info: transfering file | ${flatorigin}"
+				    drawline
+				    exec 16>&1	
+				    if [ "${flatorigin//-flat/}" != "${flatorigin}" -a "$LICENSEKEY" -eq "1" -a "$force_rsync" == "0" -a "$APPNAM" == "XSIBACKUP-PRO" ]
+				    then
+					if [ "$backupprog" != "xsidiff" ]
+					then
+					    writeout "Info: first Rsync transfer is assumed by XSIDiff, as it is faster and will preserve VMFS data sparseness"
+					    drawline
+					fi
+					RSYNCOUT=$( ("$PWD/bin/xsidiff" --source="${flatorigin}" --target=stdout "$XSIDIFFSILENT" | eval ssh "$SSHOPTS" -p$baksrvport ${defremusr}@$baksrvaddr "\"${RMXSIDFPATH//\ /\\ }\" --source=stdin --target=\"${flattarget//\ /\\ }\"" >&16) 2>&1 )
+				    	RSYNCOUT="$( echo "$RSYNCOUT" | sed '/FIPS mode initialized/d' )"
+					drawline
+				    else
+					if [ "$LICENSEKEY" -ne "1" ]
+					then
+					    writeout "\033[0;34mInfo: activate your (c)XSIDiff license to boost transfer speed\033[0m"	
+					    drawline
+					fi
+					if [ "${rsyncoptions}" != "" ]
+					then
+					    writeout "\e[1mRsync\033[0m: the following additional options have been set by the user"
+					    drawline	
+					fi
+					RSYNCOUT=$( ("$PWD/bin/xsibackup-rsync" -rlpDv --progress ${rsyncoptions} --whole-file --sparse --rsh="ssh $SSHOPTS -p$baksrvport" --rsync-path="${RMRSYNCPATH}" "$flatorigin" ${defremusr}@$baksrvaddr:"${flattarget}" >&16) 2>&1 )
+				    	RSYNCOUT="$( echo "$RSYNCOUT" | sed '/FIPS mode initialized/d' )"
+					drawline
+				    fi
+				    exec 16>&-
+				    if [ "$RSYNCOUT" != "" ]
+				    then
+                                    	if [ "${RSYNCOUT//kex protocol error/}" != "${RSYNCOUT}" ]
+                                    	then
+                                            writeout "\033[0;31m[$NAM] info: trapped kex protocol error\033[0m"
+					    ERR CLRSYNC6 "[$NAM] error: rsync warning, details: ${RSYNCOUT}" W		    	    		
+				    	elif [ "${RSYNCOUT/ESXMapperGetPhysicalMapping:/}" != "${RSYNCOUT}" ]
+				    	then
+				    	    drawline
+				    	    writeout "[$NAM] CLXSIDF0 warning: you are probably using (c)XSIDiff on a file residing in a non VMFS volume,"
+				    	    writeout "empty areas were not skipped, you can ignore this message but use --certify-backup to verify .vmdk"
+				    	    writeout "integrity and consider placing this file in a VMFS formatted volume to allow XSIDiff to jump over zeros"
+				    	    writeout "Details:"
+				    	    writeout "\e[1m\t${RSYNCOUT}\033[0m"
+				    	    ERR CLXSIDF0 "[$NAM] warning: you are probably using (c)XSIDiff on a file residing in a non VMFS volume, empty areas were not be skipped, you can ignore this message but use --certify-backup to verify .vmdk integrity and consider placing this file in a VMFS formatted volume, details: ${RSYNCOUT}" W
+				    	else
+					    writeout "[$NAM] CLXSIDF1 error: file transfer error: \033[0;31m${RSYNCOUT}\033[0m"
+					    ERR CLXSIDF1 "[$NAM] error: XSIDiff error, details: ${RSYNCOUT}"	
+				        fi
+				        drawline
+				    fi
+				else
+				    FRsync=0					
+				    writeout "\e[1mRsync\033[0m: comparing file sizes..."
+				    drawline
+				    if [ $(compSizes "$flatorigin" "$baksrvaddr:$baksrvport:$flattarget") == "0" ]
+				    then
+					writeout "\e[1mRsync\033[0m: sizes are different, calculating delta checksums, can take a while, time for a coffee..."
+					drawline
+					FRsync=1
+				    else
+					writeout "File sizes are equal"
+					drawline
+					if [ "$compsizeonly" != "true" ]
+					then	
+					    writeout "\e[1mRsync\033[0m: comparing checksums on both files, can take from a few seconds to several minutes, depending on the sizes..."
+					    if [ $(compHashes "$flatorigin" "$baksrvaddr:$baksrvport:$flattarget") == "0" ]
+					    then
+						writeout "But checksums are different, calculating delta checksums, can take a while, time for a coffee..."
+						FRsync=1
+					    else
+						writeout "And checksums are equal too, skipping $flatorigin"
+						FRsync=0
+					    fi
+					else
+					    FRsync=0
+					fi	
+				    fi
+					
+				    if [ $FRsync -eq 1 ]
+				    then
+					writeout "\e[1mRsync\033[0m: transfering file [ ${flatorigin} ]"
+					drawline
+					exec 16>&1
+					RSYNCOUT=$( ("$PWD/bin/xsibackup-rsync" -rlpDv --progress --block-size=131072 --inplace --partial --rsh="ssh -T -x $SSHOPTS -p$baksrvport" --rsync-path="$RMRSYNCPATH" "$flatorigin" ${defremusr}@$baksrvaddr:"${flattarget}" >&16) 2>&1 )
+					RSYNCOUT="$( echo "$RSYNCOUT" | sed '/FIPS mode initialized/d' )"
+					exec 16>&-    					
+	                                if [ "$RSYNCOUT" != "" ]
+	                                then
+	                                    if [ "${RSYNCOUT//kex protocol error/}" != "${RSYNCOUT}" ]
+	                                    then
+	                                        writeout "\033[0;31m[$NAM] info: trapped kex protocol error\033[0m"
+	                                    	drawline
+	                                    else
+	                                        writeout "\033[0;31m[$NAM] error: ${RSYNCOUT}\033[0m"
+	                                        drawline
+	                                        ERR CLRSYNC7 "[$NAM] error: rsync error, details: ${RSYNCOUT}"
+	                                    fi
+	                                fi
+    				    fi
+    				fi
+    			     
+    			     elif [ "$backupprog" == "borg" ]
+    			     then	
+    				TOCOPY="$TOCOPY \"$flatorigin\""
+    			     fi
+    				
+    			    else
+    			    	VMWARNS="The file \"$flatorigin\" is locked. Independent disks cannot be hot backed up, issue a cold backup or exlude the disk. Make sure that the VM state (on/off) was not manually changed during the backup"
+    			    	writeout "\033[0;31mThe file \"$flatorigin\" is locked. Independent disks cannot be hot backed up, issue a cold backup for or exlude the disk from the backup. Make sure that the VM state (on/off) was not manually changed during the backup\033[0m"
+    			    	ERR CLORILK1 "[$NAM] error: the file \"$flatorigin\" is locked. Independent disks cannot be hot backed up, issue a cold backup or exlude the disk. Make sure that the VM state (on/off) was not manually changed during the backup" "W"
+    			    fi # isFileOpen
+    			fi # exists
+    		    fi # flat file is not ""
+    		    
+    		else
+    		    VMWARNS="The file \"$flatorigin\" is locked. Independent disks cannot be hot backed up, please issue a cold backup for [$NAM] or exlude the disk from the backup"
+    		    ERR CLORILK2 "[$NAM] error: the file \"$origin\" is locked by some process, it was not copied" "W"
+    		fi 
+    		# isFileOpen "$origin"	
+	     fi 
+             # exists "$origin"           
+       	  fi 
+          # is of type NET
+        fi
+        
+        if [ $? -ne 0 ]
+        then
+            ERR CLGEN001 "[$NAM] error: general error, details: $?"	
+        fi
+
+        done
+
+	# Remove excluded disks from the .vmx file
+	if [ "$THEEXCLUSIONS" != "" ]
+	then
+	    if [ "$SERVERTYPE" = "DIR" ]
+	    then
+		IFS=';'
+		for exclusion in $THEEXCLUSIONS
+		do
+		    # Remove disks
+		    exclstr=${exclusion//.vmdk/}
+		    remvmxpath=$( ls "$thedir"/*.vmx )
+		    deletewhat=$( cat "$remvmxpath" | grep -E "${exclstr}-*[0-9]*.vmdk" | awk -F "." '{print $1}' | head -n1 | sed -e 's/^ *//g' -e 's/ *$//g' )
+		    if [ "$deletewhat" != "" ]
+		    then    
+			sed -i "/$deletewhat/d" "$remvmxpath"
+		    fi
+		done
+	    elif [ "$SERVERTYPE" = "NET" ]
+	    then	
+		IFS=$newline
+		VMXCONT="$VMXFILECONTENT"
+		for exclusion in $INDEPENDENTDSK
+		do
+		    if [ "$exclusion" != "" ]
+		    then	
+		    	VMXCONT=$( echo "$VMXCONT" | sed "/$exclusion/d" )
+		    fi	
+		done
+		VMXCONT="$VMXCONT"
+		if [ "$backupprog" == "rsync" ]
+		then
+		    IFS=$OLDIFS
+		    IFS="¨"
+		    rmd=$( ( echo "$VMXCONT" | ssh -o StrictHostKeyChecking=no -i "${PWD}"/xsibackup_id_rsa -p"$baksrvport" ${defremusr}@"$baksrvaddr" "cat > "${thedir// /\\ }"/"${VMXFILENAME// /\\ } ) 2>&1 )
+		    rmd="$( echo "$rmd" | sed '/FIPS mode initialized/d' )"
+		    IFS=$OLDIFS	
+		elif [ "$backupprog" == "borg" ]
+		then
+		    rmd=$( echo "$VMXCONT" > "/tmp/$VMXFILENAME" )
+		fi
+		VMXCONT=""
+		if [ "$rmd" != "" ]
+		then
+		    writeout "\033[0;31m[$NAM] error CLNUPVMX: cannot update VMX file: ${rmd}, details: $rmd\033[0m"
+		    ERR CLNUPVMX "[$NAM] error: cannot update VMX file, details: $rmd"
+		fi
+	    fi
+	    writeout "Excluded disks removed from backup .vmx file"
+	    drawline
+	fi
+	
+	# CERTIFY BACKUP	
+	if [ -f "$PWD"/src/pro/certify -a "$APPNAM" == "XSIBACKUP-PRO" ]
+	then
+	    . "$PWD"/src/pro/certify
+	else
+	    if [ "$APPNAM" == "XSIBACKUP-FREE" -a "$certifybackup" != "" ]
+	    then
+	        certifybackup=no
+	        VMCERTIFIED=2
+	        up2Pro "Backup certification"
+	    fi
+	fi
+
+	# BORG BACKUP
+	if [ "$backupprog" == "borg" ]
+	then	
+	    if [ -f "$PWD"/src/pro/borg -a "$APPNAM" == "XSIBACKUP-PRO" ]
+	    then
+	    	if [ "$SERVERTYPE" != "NET" ]
+	    	then
+	    	    echo -e "\033[0;31m[$NAM] error: the backup point must be a server:port:path string to backup to a Borg server\033[0m"
+	    	fi
+	    	TOCOPY=${TOCOPY//\" \"/|}
+	    	TOCOPY=${TOCOPY//\"/}
+	    	writeout "[$NAM] Starting Borg backup"
+	    	drawline
+	    	borgSend "${TOCOPY}" "$baksrvaddr:$baksrvport:$2" "$NAM"
+	    else
+		up2Pro "Borg support"	
+	    fi	
+	fi
+
+	delSnapshot=$( (deleteSnapshot $1 ) 2>&1 )
+        if [ "$delSnapshot" != "" ]
+        then
+            ERR CLDELSN3 "[$NAM] error: cannot delete snapshot, details: ${delSnapshot}"
+        fi
+}
+
+getMountedPath(){
+
+    Path1=${1%/}
+    DSName=$( echo "${Path1#/vmfs/volumes/}" | awk -F '/' '{print $1}' )
+    Mount2Phys=$( ls -la /vmfs/volumes | grep "^l" | awk '{print substr($0, index($0, $9))}' )
+
+    RTNPATH=""
+    IFS=$newline
+    for xpath in $Mount2Phys
+    do
+        Link="$( echo $xpath | awk -F '->' '{print $1}' | sed -e 's/^ *//g' -e 's/ *$//g' )"
+        Phys="$( echo $xpath | awk -F '->' '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' )"
+        if [ "$DSName" == "$Link" ]
+        then
+            RTNPATH="/vmfs/volumes/$DSName"
+            break
+        elif [ "$DSName" == "$Phys" ]
+        then
+            RTNPATH="/vmfs/volumes/$Link"
+            break
+        fi
+    done
+    IFS=$OLDIFS
+    if [ -d "$RTNPATH" -a -L "$RTNPATH" ]
+    then
+        echo "$RTNPATH"
+    fi
+
+}
+
+# Preparing of images for the HTML layout
+
+img0="<a href=\"http://33hops.com/\"><img src=\"http://33hops.com/downloads/?f=../images/logo1.gif&${SESSIONID}\" alt=\"33HOPS Logo\"></a>"
+img1="<a href=\"https://twitter.com/intent/user?screen_name=xsibackup\"><img src=\"http://33hops.com/images/follow_tw.jpg\" alt=\"Twitter\"></a>"
+img2="<a href=\"https://www.facebook.com/xsibackup\"><img src=\"http://33hops.com/images/follow_fb.jpg\" border=\"0\" alt=\"Facebook\"></a>"
+img3="<a href=\"https://es.linkedin.com/pub/daniel-j-garc%C3%ADa-fidalgo/21/b41/55b\"><img src=\"http://33hops.com/images/follow_ln.jpg\" border=\"0\" alt=\"Linkedin\"></a>"
+if [ "$SHOWNEWVER" != "" ]
+then
+    img4="Ver. $SHOWNEWVER is available<br><a href=\"http://33hops.com/user-access.html\">Download here</a>"
+else
+    A=$(head -c1 /dev/urandom);A=$(printf '%d\n' "'$A");Nu=$((A/85+1))
+    img4="<img src=\"http://33hops.com/images/come-on_${Nu}.gif\" border=\"0\" alt=\"Come on!, give us some like\">"
+fi
+img5="<a href=\"http://33hops.com/?xsipancar\"><img src=\"http://33hops.com/images/xsibackup_banner2.jpg?${SESSIONID}\" alt=\"XSIBackup banner\"></a>"
+
+if [ -f "$PWD"/src/pro/custimgs -a "$APPNAM" == "XSIBACKUP-PRO" ]
+then
+    . "$PWD"/src/pro/custimgs
+else
+    if [ "$APPNAM" == "XSIBACKUP-FREE" -a "$imglist" != "" ]
+    then
+        up2Pro "E-mail layout customization"
+    fi
+fi
+
+# We define the HTML and table e-mail header
+headHTMLStr="<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\" \"http://www.w3.org/TR/html4/loose.dtd\">\r\n
+		<html xmlns=\"http://www.w3.org/1999/xhtml\">\r\n
+		<head>\r\n
+		<title>$APPNAM $APPVER e-mail report</title>\r\n"
+		
+stylesHTMLStr="<style type=\"text/css\">\r\n
+		
+		body{\r\n
+                  font-size: 14px;\r\n
+                  font-family: arial;\r\n
+                  font-weight: 400;\r\n
+		  color: #333333;\r\n	
+		}\r\n	
+		
+		.txthost{\r\n
+		  color:#0000AA;\r\n  
+		}\r\n
+		
+		.errr{\r\n
+		  color:#DD0000;\r\n
+		}\r\n
+
+                .green{\r\n
+                  color:#107000;\r\n
+                }\r\n
+
+                .red{\r\n
+                  color:#A30000;\r\n
+                }\r\n
+
+                .grey{\r\n
+                  color:#AAAAAA;\r\n
+                }\r\n
+		
+                .warn{\r\n
+                  color:#D74700;\r\n
+                }\r\n
+		
+                .lok{\r\n
+                  color:#FFFFFF;\r\n
+                  background-color:#669933;\r\n
+                  font-weight:600;\r\n
+                }\r\n
+
+                .lko{\r\n
+                  color:#FFFFFF;\r\n
+                  background-color:#CC3333;\r\n
+                  font-weight:600;\r\n
+                }\r\n
+		
+                .ok{\r\n
+                  color:#FFFFFF;\r\n
+                  background-color:#0C3300;\r\n 
+                  font-weight:600;\r\n 
+                }\r\n	
+                
+                .ko{\r\n
+                  color:#FFFFFF;\r\n
+                  background-color:#A10008;\r\n
+                  font-weight:600;\r\n
+                }\r\n                	
+			
+		.report td{\r\n
+		  font-size:12px;\r\n
+		  font-family:arial;\r\n
+		  font-weight:400;\r\n
+		  border-color:#AAAAAA;\r\n
+		  border-width: 1px 1px 1px 1px;\r\n
+		  border-top-style:dotted;\r\n
+		  border-left-style:dotted;\r\n
+		  border-right-style:solid;\r\n
+		  border-bottom-style:solid;\r\n
+		  margin:0;\r\n
+		  padding:4px;\r\n
+		}\r\n
+		
+		.report td.separator{\r\n
+		  border-width: 0px;\r\n
+		}\r\n
+		
+                .l{\r\n
+                  float: left;\r\n
+                }\r\n		
+		
+		.r{\r\n
+		  float: right;\r\n
+		}\r\n
+					
+		</style>\r\n"
+		
+	logosHTMLStr="</head><body>\r\n"
+	
+	if [ "$img0" != "&nbsp;" ] || [ "$img2" != "&nbsp;" ] || [ "$img3" != "&nbsp;" ] || [ "$img4" != "&nbsp;" ]
+	then
+	logosHTMLStr=${logosHTMLStr}"<table border=\"0\">\r\n
+			  <tr>\r\n
+			    <td>${img0}</td>\r\n
+			    <td width=\"70\">&nbsp;</td>\r\n
+                            <td>${img1}</td>\r\n
+                            <td>${img2}</td>\r\n
+                            <td>${img3}</td>\r\n
+                            <td>${img4}</td>\r\n
+			  </tr>\r\n
+			</table>\r\n    
+			<br>\r\n"
+	fi	
+	if [ "$img5" != "" ]
+	then	  
+	    bannerHTMLStr="
+		<table width=\"700\">\r\n
+                    <tr>\r\n
+                       <td colspan=\"8\" align=\"center\">${img5}</td>\r\n
+                    </tr>\r\n
+                    <tr>\r\n
+                       <td colspan=\"8\" height=\"10\" class=\"error\">&nbsp;</td>\r\n
+                    </tr>\r\n
+                </table>\r\n
+                "
+	fi
+		
+	hostipHTMLStr="
+	<table border=\"0\" width=\"700\">\r\n
+		<tr>\r\n
+			<td width=\"50%\">$(date)<br>
+		<b>${APPNAM} ${APPVER} AT HOST:<br>\r\n
+		 <span class=\"txthost\">${HOSTNAME}</span></b><br>\r\n
+					</td>\r\n
+					<td width=\"50%\" align=\"right\">\r\n
+					 <b>IP v4:</b> "${HOSTIP}"/&nbsp;"${HOSTMASK}"<br>"$(vmware -v)"<br><br>\r\n
+			</td>\r\n
+				</tr>\r\n
+			 "
+	if [ "$testmode" == "true" ]
+	then 
+		hostipHTMLStr="${hostipHTMLStr}<tr>\r\n
+	<td colspan=\"2\"><br><span class=errr><b>TEST MODE ACTIVATED, REMOVE --test-mode=true TO MAKE A BACKUP</b></span></td>\r\n
+	</tr>\r\n"        	
+	fi
+                        	
+	    hostipHTMLStr="${hostipHTMLStr}
+		<tr>\r\n
+		   <td colspan=\"2\">&nbsp;</td>\r\n
+		</tr>\r\n
+	      </table>\r\n"  
+			
+	    vmlistHTMLStr="<table width=\"700\" border=\"0\" class=\"report\">"
+
+LISTA=$( vim-cmd vmsvc/getallvms )
+
+if [ "${backupvms//REGEXP/}" != "${backupvms}" ]
+then
+    if [ -f "$PWD"/src/pro/vmsregexp ]
+    then
+        . "$PWD"/src/pro/vmsregexp
+    fi
+fi
+
+writeout "\e[1mGetting list of all VMs...\033[0m"
+drawline
+
+ii=0
+IFS=$newline
+for line in $LISTA
+do
+
+ISVMLINE=0
+ISXSIBAK=0
+if [ "${override//xsibakfilter/}" == "$override" ]
+then
+    if [ "${line/_XSIBAK/}" != "$line"  ]
+    then
+    	ISXSIBAK=1
+    fi
+fi
+
+if [ "${line/vmx-/}" != "$line"  ] && [ "${line/Guest/}" != "$line"  ] && [ "${line/.vmx/}" != "$line"  ] && [ "$ISXSIBAK" == "0" ]
+then
+	ISVMLINE=1
+fi
+
+if [[ "$ii" -gt "0" ]] && [[ "$ISVMLINE" == "1" ]]
+then
+
+	writeout $line
+	
+	VMPID=$(echo $line | awk '{ print $1 }')		
+	VMNAM=$( getVMName $VMPID )
+
+	ISEXCLUDED="NO"
+        IFS=","
+        for xvm in $excludevms
+        do
+            EXCLVM=$( echo "$xvm" | sed -e 's/^ *//g' -e 's/ *$//g' )
+            if [ "$VMNAM" == "$EXCLVM" ]
+            then
+                ISEXCLUDED="YES"
+            fi
+        done
+        IFS=$newline
+	
+	if [ "$ISEXCLUDED" == "NO" ]
+	then
+	    LISTA2=$LISTA2$newline"$line"
+	fi		
+
+	if [[ "$(get_vm_state $VMPID)" == "ON" ]]
+	then
+            if [ "$ISEXCLUDED" == "NO" ]
+            then
+                LISTAON="$LISTAON"$newline"$line"
+            fi		    
+	else
+	    LISTAOF=$LISTAOF$newline"$line"
+	fi
+	
+	IFS=','
+	for svm in $backupvms
+	do
+		IFS='!'
+		tp=1
+		for vmpart in $svm
+		do
+			if [ $tp -eq 1 ]
+			then
+				if [[ "$vmpart" == "$VMNAM" ]]
+                		then
+                        		LISTACU=$LISTACU$newline"$line"
+                		fi
+			fi
+		tp=$(( $tp+1 ))
+		done
+		IFS=','	
+	done
+	IFS=$newline	
+	fi
+
+ii=$(( $ii+1 ))
+done
+IFS=$OLDIFS
+
+LISTA2=$( echo "$LISTA2" | sed -e '/./,$!d' )
+LISTAON=$( echo "$LISTAON" | sed -e '/./,$!d' )
+LISTAOF=$( echo "$LISTAOF" | sed -e '/./,$!d' )
+LISTACU=$( echo "$LISTACU" | sed -e '/./,$!d' )
+
+if [ "$backuptype" == "custom" ]
+then
+	LISTA2=$LISTACU
+fi
+
+if [ "$backuptype" == "running" ]
+then
+        LISTA2=$LISTAON
+fi
+
+drawline
+
+if [ "$LISTA2" == "" ]
+then
+	writeout "\033[0;31mError NOVM2BAK: no VMs to backup\033[0m"
+        drawline
+        ERR NOVM2BAK "Error: no VMs to backup"
+else        
+	writeout "VMs to backup:"
+	drawline
+
+	#writeout "$LISTA2"
+	IFS=$newline
+	for VM2BAK in $LISTA2
+	do
+	    writeout "$VM2BAK"
+            VMPID2=$(echo "$VM2BAK" | awk '{ print $1 }')
+            
+            VMSIZES="$( getVMSize $VMPID2 )"
+
+#echo "$VMSIZES"
+
+	    if [ "$VMSIZES" == "null-null" ]
+	    then
+   		writeout "Error: skipping, not able to retrieve VM information"
+		drawline
+		ERR NOVM3BAK "Error: skipping, not able to retrieve VM information" 
+	    else
+	    	VMSIZE=$( echo "$VMSIZES" | awk -F '-' '{print $1}' )
+	    	VMSIZS=$( echo "$VMSIZES" | awk -F '-' '{print $2}' )		
+            	VMSIZEVAR=VM${VMPID2}SIZE
+	    	VMSIZSVAR=VM${VMPID2}SIZS
+            	eval $VMSIZEVAR="\$VMSIZE"
+	    	eval $VMSIZSVAR="\$VMSIZS"
+	    	VMSALL=$(($VMSALL+$VMSIZE))
+	    	VMSPRS=$(($VMSPRS+$VMSIZS))	
+	    fi
+	done
+	IFS=$OLDIFS	
+	
+	drawline
+
+	if [ "$testmode" == "true" ]
+	then
+		ENOUGH_ROOM=1
+	fi
+	if [ "${backupprog_options//z/}" != "$backupprog_options"  ]
+	then	
+	    bakopts="compression&nbsp;enabled"
+	else
+	    bakopts="no&nbsp;compression"    	
+	fi	
+	
+	if [ -z "$backupid" -o "${#backupid}" -eq "0" ]
+	then
+	    theid="unknown"
+	else
+	    theid="$backupid"
+	fi
+	vmlistHTMLStr=$vmlistHTMLStr"<tr>\r\n
+              <td colspan=\"8\">Done <b>"$backuphow"</b> backup (id: <b>"$theid"</b>) using <b>"$backupprog"</b> ("$bakopts")<br></td>\r\n
+        </tr>\r\n"
+	
+	if [ "$datedir" == "yes" ]
+	then
+	        vmlistHTMLStr=$vmlistHTMLStr"<tr>\r\n
+	              <td colspan=\"8\">Backing up to folder <b>"$backuppoint"/"$newdirmask"</b><br></td>\r\n
+	        </tr>\r\n"        
+	fi
+
+	if [ "$SERVERTYPE" = "DIR" ]
+	then
+		
+		NEEDED_ROOM=$(($VMSALL/1024))
+		SPARSE_ROOM=$(($VMSPRS/1024))
+		
+	        AVAILA_ROOM=$(avail_backup_room "$backuppoint")
+		
+		if [ "$AVAILA_ROOM" == "-1" ]
+		then
+		    writeout "\033[0;31mCould not get available backup room in backup datastore\033[0m"	
+		    ERR CHKAVRUM "Error: cannot determine the available backup room, -1 returned"		    	
+		fi
+		if [ "$AVAILA_ROOM" -eq "$AVAILA_ROOM" ] 2>/dev/null
+		then
+		    AVAILA_ROOM=$(($AVAILA_ROOM/1024))	
+		else
+		    writeout "Warning: returned value for Available Backup Room $AVAILA_ROOM"
+		    AVAILA_ROOM="0"
+		fi
+
+		writeout "Needed room: $NEEDED_ROOM Gb."
+		writeout "Sparse size: $SPARSE_ROOM Gb."
+		writeout "Available room: $AVAILA_ROOM Gb."
+		drawline
+		if [[ $(($NEEDED_ROOM+4)) -lt $AVAILA_ROOM ]]
+		then
+		    ENOUGH_ROOM=1
+		else	
+		ENOUGH_ROOM=0
+		writeout "\033[0;36mNot enough room to make the backup, some older folders will be deleted\033[0m"
+		drawline
+		fi
+		if [ "$backuproom" -gt 0 ]
+		then
+	            vmlistHTMLStr=$vmlistHTMLStr"<tr>\r\n
+			 <td colspan=\"8\">The backup room has been limited to "$backuproom" Gb.<br></td>\r\n
+			</tr>\r\n"	        	
+	        fi
+		vmlistHTMLStr=$vmlistHTMLStr"<tr>\r\n
+	            <td colspan=\"8\">Available room in device $backuppoint before backup: "$AVAILA_ROOM" Gb.<br>
+		     Sparse size on disk of the selected virtual machines: "$SPARSE_ROOM" Gb.<br>
+	             Needed room in device $backuppoint for backup: "$NEEDED_ROOM" Gb.</td>\r\n
+		   </tr>\r\n"
+	else
+		vmlistHTMLStr=$vmlistHTMLStr"<tr>\r\n
+	            <td colspan=\"8\">Mirroring following VMs to "$backuppoint"...<br>
+	            </td>\r\n
+	           </tr>\r\n"
+	fi
+
+	vmlistHTMLStr=$vmlistHTMLStr"<tr>\r\n
+<td><b>(Id)VM Name</b></td>\r\n
+<td><b>State</b></td>\r\n
+<td><b>Size (Gb)</b></td>\r\n
+<td><b>Stop</b></td>\r\n
+<td><b>Copy</b></td>\r\n
+<td><b>Start</b></td>\r\n
+<td><b>Time (min)</b></td>\r\n
+<td><b>Speed (mb/s)</b></td>\r\n
+</tr>\r\n"
+	
+fi
+# End of LISTA2 != check
+
+DIFFALL=0
+if [ "$LISTA2" != "" ]
+then
+
+    STARTALL=$(date +%s)
+    ivmls=0
+    IFS=$newline
+    for line in $LISTA2
+    do
+	VMERRS=""
+	VMWARNS=""
+	vmlistHTMLStr=$vmlistHTMLStr"<tr>\r\n"
+	STARTVM=$(date +%s)
+
+	VMIDNU=$( echo $line | awk '{ print $1 }' )
+	VMNAME=$( getVMName $VMIDNU )
+		vmlistHTMLStr=$vmlistHTMLStr"<td><b>(${VMIDNU}) ${VMNAME}</b></td>"
+	VMSTAT=$(get_vm_state $VMIDNU)
+	if [ "$VMSTAT" == "ON" ]
+	then
+		c="lok"
+	else
+		c="lko"
+	fi	
+		vmlistHTMLStr=$vmlistHTMLStr"<td class=\""${c}"\"><b>"${VMSTAT}"</b></td>"
+	VMSIZEVAR=VM${VMIDNU}SIZE
+	VMSIZSVAR=VM${VMIDNU}SIZS
+	VMSIZE=$( eval "echo \$$VMSIZEVAR" )
+	VMSIZS=$( eval "echo \$$VMSIZSVAR" )
+
+		vmlistHTMLStr=$vmlistHTMLStr"<td><b>"$(($VMSIZE/1024))"/&nbsp;<span class=\"grey\">"$(($VMSIZS/1024))"</span></b></td>"
+	
+	VMLOCA=$( echo $line | awk '{ print $8 }' )
+	toolsStatus="$( vim-cmd vmsvc/get.guest $VMIDNU "toolsStatus" | grep "toolsStatus" | sed -e 's/\"//g' -e 's/\,//g' | awk -F '=' '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' )"
+
+	writeout "\e[1m[$VMNAME] Starting backup\033[0m (size is ${VMSIZE}M on ${VMSIZS}M file)"
+	drawline
+	writeout "XSIBackup will backup your VMs while they are running and will quiesce guest services too, so that users"
+	writeout "can continue to use the VM while the backup is taking place. You can also run \e[1mcold\033[0m and \e[1mwarm\033[0m --backup-how"
+	drawline
+
+	if [ "$backuphow" == "cold" -o "$backuphow" == "warm" ]
+	then
+	    if [ "$VMSTAT" == "ON" ]
+	    then	
+		writeout "Stopping VM [$VMNAME]"
+	    	drawline
+	    	if [ "$toolsStatus" != "toolsOk" ]
+	     	then
+		    vim-cmd vmsvc/power.off $VMIDNU
+		    writeout "\033[0;36mVMware Tools are not present or outdated in VM: [$VMNAME], power-off issued\033[0m"
+		    EXITCODE="OK (Power Off)"
+	    	else
+		    vim-cmd vmsvc/power.shutdown $VMIDNU
+	    	fi
+	    wait2shut="30"
+	    if [ "$shutdownwait" != "" ]
+	    then
+	    	wait2shut="$shutdownwait"
+	    fi
+	    sleep "${wait2shut}"
+	    writeout "Sleeping :-o "${wait2shut}" s, waiting for VM to be off"	
+	    drawline
+	    EXITCODE="OK (Shutdown)"	
+	    	m=0	
+	    	while [ "$(get_vm_state $VMIDNU)" == "ON" ]
+	    	do
+		    if [ "$m" -lt "3" ]
+		    then
+		    	writeout "SLEEPING 10 s, waiting for VM to be off"
+		    	drawline
+		    	sleep 10
+		    	EXITCODE="OK (Shutdown)"
+		    else
+		    	if [ "$m" -eq "3" ]
+		    	then
+			     vim-cmd vmsvc/power.off $VMIDNU
+			     sleep 10
+		    	fi
+		    	if [ "$?" -ne "0" ]
+                    	then
+                    	    EXITCODE="KO (Power Off)"
+                    	else
+                            EXITCODE="OK (Power Off)"
+                    	fi
+		    fi
+	    	m=$(($m+1))
+	    	done
+	    else
+		writeout "VM [$VMNAME] was already in an Off state"	
+		drawline
+		EXITCODE="-"
+	    fi
+	else
+	    if [ "$VMSTAT" == "ON" ]
+	    then    	
+		writeout "Hot backup selected for VM: [$VMNAME], will not be switched off"
+		drawline
+		EXITCODE="NO (hot backup)"
+	    else
+	        writeout "Hot backup selected for VM: [$VMNAME], the VM is off though"
+	        drawline
+	        EXITCODE="Off yet"
+	    fi
+	fi
+
+	# EXCLUDE DISKS
+        EXCLUDEVMDK=""
+	EXCLUDEDDISKS="$( echo "$backupvms" | awk -F "${VMNAME}!" '{print $2}' | awk -F "," '{print $1}' )"
+	if [ "$EXCLUDEDDISKS" != "" ]
+	then
+	    EXCLUDEVMDK="$EXCLUDEDDISKS"
+            VMWARNS="[$VMNAME] Info: disks [$EXCLUDEVMDK] have been excluded from the backup"
+            ERR VMBDEXC1 "[$VMNAME] Info: disks [$EXCLUDEVMDK] have been excluded from the backup" W
+	fi
+
+	vmlistHTMLStr=$vmlistHTMLStr"<td><b>"$EXITCODE"</b></td>"
+
+	VMOS=$( echo "$line" | awk -F "Guest" '{print $1}' | awk -F ".vmx" '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' )
+	QUIESCEVM="0"
+	if [ "${snapshot//doquiesce/}" != "$snapshot" ]
+	then
+	    QUIESCEVM="1"	
+	fi	
+	VMXDIRE=$( getVMXDir $VMIDNU )	
+	VMXFILE=$( ls "$VMXDIRE"/*.vmx )
+	ISEFI=$( cat "$VMXFILE" | grep "firmware = \"efi\"" | wc -l )
+	if [ "$ISEFI" -eq "1" ]
+	then
+	    BOOTPARTITION="EFI"    	
+	else
+	    BOOTPARTITION="MBR"	
+	fi
+	writeout "[$VMNAME] info: boot partition is $BOOTPARTITION"
+	drawline
+	ISWIN64="0"
+
+	if [ $( echo "$VMOS" | awk '{print tolower($0)}' | grep "^win.*64.*" | wc -l ) -eq "1" ]
+	then
+	    writeout "\033[0;36m[$VMNAME] info: Win64 OS ($VMOS) detected on $BOOTPARTITION, applying Windows algorithm\033[0m"
+	    ISWIN64="1"
+	    drawline
+	fi
+	
+	if [ "$testmode" != "true" ]
+	then		
+		VMCERTIFIED=1
+		VMDIRN=$( getVMDir $VMIDNU )
+		if [ "$SERVERTYPE" = "DIR" ]
+		then
+		    if [ $ENOUGH_ROOM == 0 ]
+		    then
+			MAKEROOMRESP="noresp"
+			if [ "$backupprog" != "onediff" ]
+			then
+			    makeRoomHtml=""
+			    # Now we make room for the current backup
+			    ROOMWENEED=$(( $VMSIZE * (120/100) + 12288 ))
+			    DSROOT=$( getMountedPath $backuppoint )
+			    writeout "[$VMNAME] Info: attempting to free $ROOMWENEED mb at [ $DSROOT ]"
+			    drawline
+			    MAKEROOMRESP=$( make_room $ROOMWENEED "$backuppoint" )	
+			else
+			    if [ "$(( $NEEDED_ROOM * (120/100) ))" -lt "$AVAILA_ROOM" ]
+			    then
+			        writeout "\033[0;31mYour datastore [$backuppoint] is below 30% of extra security margin size\033[0m"
+			        writeout "\033[1;36mXSIBackup will try to make room by deleting the eldest timestamped YYYMMDDhhmmss folders\033[0m"
+			        MAKEROOMRESP=$( make_room $(( $NEEDED_ROOM * (130/100) )) "$backuppoint" ) 
+			    else
+                                writeout "\033[1;36m********************************************************************************************************\033[0m"
+                                writeout "\033[1;36mWARNING:\033[0m"
+				writeout "\033[1;36mYou have $AVAILA_ROOM gigabytes left when the VMs to backup are $NEEDED_ROOM gigabytes in size\033[0m"
+                                writeout "\033[1;36mThis is a OneDiff backup, you don't need all the space, as only the changed bytes will be sent\033[0m"
+                                writeout "\033[1;36mStill, you need some room to manouver and consolidate the snapshots. Add more storage room ASAP please\033[0m"
+                                writeout "\033[1;36m********************************************************************************************************\033[0m"			    	
+			    	writeout "\033[1;36mXSIBackup will try to make room by deleting the eldest timestamped masked folders\033[0m"
+			    	MAKEROOMRESP=$( make_room $(( $NEEDED_ROOM * (130/100) )) "$backuppoint" )
+			    fi
+			fi
+                        if [ "$MAKEROOMRESP" != "" -a "$MAKEROOMRESP" != "noresp" ]
+                        then
+                            makeRoomHtml="<tr>\r\n
+                            <td colspan=\"8\"><b>The eldest folders were deleted to make room:</b><br>"$MAKEROOMRESP"</td>\r\n
+                            </tr>\r\n"
+                        fi			
+		    fi
+
+		    if [ "$backupprog" = "onediff" ]
+		    then	
+			diffVM $VMIDNU "$EXCLUDEVMDK" "$toolsStatus"
+		    else
+			cloneVM $VMIDNU "$baksrvdire" "$EXCLUDEVMDK" "$backupprog" "$toolsStatus" "$VMSTAT"
+		    fi
+			
+		elif [ "$SERVERTYPE" = "NET" ]
+		then
+		    if [ "$backupprog" = "onediff" ]
+                    then
+                        diffVM $VMIDNU "$EXCLUDEVMDK" "$toolsStatus"
+                    elif [ "$backupprog" = "rsync" -o "$backupprog" = "xsidiff" -o "$backupprog" = "borg" ]
+                    then
+                    	cloneVM $VMIDNU "$baksrvdire" "$EXCLUDEVMDK" "$backupprog" "$toolsStatus" "$VMSTAT"
+                    else
+		    	writeout "\033[0;31m[$VMNAME] error LSWRNPRG: $backupprog is not an allowed --backup-prog argument, exiting...\033[0m"
+		    	ERR LSWRNPRG "Error: $backupprog is not an allowed --backup-prog argument, exiting..."
+		    fi
+		    if [ $? -ne 0 ]
+		    then
+			writeout "\033[0;31mError RBAKPATH: the remote backup path does not exist and cannot be created\033[0m"
+			ERR RBAKPATH "The remote backup path does not exist and cannot be created"
+		    fi
+		else
+		    writeout "\033[0;31mError RBAKSRV1: unable to determine the backup point location\033[0m"
+		    ERR RBAKSRV1 "Unable to determine the type of server parsed"
+		fi
+	else
+	    writeout "\033[0;36mTest mode activated VMs will not be cloned, please remove --test-mode=true to allow backups\033[0m"
+	    drawline
+	fi
+	sleep 10
+	if [ $? != 0 -o "$VMERRS" != "" ]
+	then
+	    EXITCODE="KO!"
+	    EXITCLAS="ko"
+	else
+            if [ "$certifybackup" == "yes" -o "$certifybackup" == "sha" -o "$certifybackup" == "sha1" -o "$certifybackup" == "md5" ]
+            then
+                if [ "$VMCERTIFIED" == "1" ]
+                then
+                    EXITCODE="$algo CERTIFIED"
+            	    EXITCLAS="ok"    
+	    	elif [ "$VMCERTIFIED" == "0" ]
+	    	then
+	    	    EXITCODE="$algo MISTMATCH"
+	    	    EXITCLAS="ko"	
+	    	else
+                    EXITCODE="Certification not available"
+		    EXITCLAS="ok"	
+                fi
+            else
+                EXITCODE="OK"
+            fi
+	    EXITCLAS="ok"
+	fi
+	
+	vmlistHTMLStr=$vmlistHTMLStr"<td class=\""$EXITCLAS"\"><b>"$EXITCODE"</b></td>"
+
+	CURRSTATE1="$( get_vm_state $VMIDNU )"
+	if [ "$backuphow" == "cold" -o "$backuphow" == "warm" ] && [ "$CURRSTATE1" == "OFF" ]
+	then
+	    if [ "$VMSTAT" == "ON" ]
+	    then
+		POWRTN="$( vim-cmd vmsvc/power.on $VMIDNU )"
+		if [ "$POWRTN" == "Powering on VM:" ]
+		then
+		    writeout "[$NAM] info: bringing VM up again"
+		    drawline
+	            if [ "$certifybackup" == "yes" ]
+	            then
+	            	if [ "$VMCERTIFIED" == "1" ]
+	            	then
+	            	    EXITCODE="$algo CERTIFIED"
+	            	    EXITCLAS="ok"
+			else
+	            	    EXITCODE="$algo MISTMATCH"
+			    EXITCLAS="ko"	
+	            	fi
+	            else	
+	        	EXITCODE="OK"
+	            fi	
+		else
+		    EXITCODE="KO"	
+		fi
+	    else
+		EXITCODE="-"
+	    fi        
+	else
+		EXITCODE="-"		
+	fi
+	vmlistHTMLStr=$vmlistHTMLStr"<td><b>"$EXITCODE"</b></td>"
+
+    	sleep 1	
+    	ENDVM=$(date +%s)
+    	TimeDIFF=$(( $ENDVM - $STARTVM ))
+	
+	vmlistHTMLStr=$vmlistHTMLStr"
+        <td><b>"$(($TimeDIFF/60))"</b></td>
+        <td><b>"$(($VMSIZE/$TimeDIFF))"/&nbsp;<span class=\"grey\">"$(($VMSIZS/$TimeDIFF))"</span></b></td>
+        </tr>"$makeRoomHtml
+	if [ "$VMERRS" != "" ]
+	then		
+		# If we have an error in the context of the current VM we output it (only last)
+		vmlistHTMLStr=$vmlistHTMLStr"
+		<tr>\r\n
+		<td colspan=\"8\" class=\"errr\"><b>Last error raised for the above VM:</b><br>"$VMERRS"</td>\r\n			
+		</tr>\r\n"
+	fi
+	# We treat warnings independently
+        if [ "$VMWARNS" != "" ]
+        then
+                # If we have a warning in the context of the current VM we output it (only last)
+                vmlistHTMLStr=$vmlistHTMLStr"
+                <tr>\r\n
+                <td colspan=\"8\" class=\"warn\"><b>Last warning for the above VM:</b><br>"$VMWARNS"</td>\r\n
+                </tr>\r\n"
+        fi		
+
+    ivmls=$(( $ivmls + 1 ))
+    done
+    IFS=$OLDIFS
+
+    ENDALL=$(date +%s)
+    DIFFALL=$(( $ENDALL - $STARTALL ))
+
+fi
+# End of LISTA2 not empty
+
+ERR_FILE_LINES=0
+if [ -f "${errfileb}" ]
+then
+    ERR_FILE_LINES=$( cat "${errfileb}" | grep " ERROR (" | wc -l )
+fi
+
+if [ "$ERR_FILE_LINES" -gt "0" ]
+then
+    writeout "Alert: some errors were raised, won't execute --del-dirs as a conservative measure"
+    drawline
+    vmlistHTMLStr=$vmlistHTMLStr"<tr>\r\n                                                                                                                                                                        m
+        <td colspan=\"8\">Alert: some errors were raised, won't execute --del-dirs as a conservative measure</td>\r\n
+        </tr>\r\n"
+else
+	if [ "$deldirs" != "" -a "$APPNAM" == "XSIBACKUP-PRO" ]
+	then
+	    if [ "$deldirs" != "" ]
+	    then
+	        if [ "$( echo "$deldirs" | grep -E "(^(\+|\-)([0-9])([0-9])?([0-9])?d$)" | wc -l )" -ne "1" ]
+	        then	    
+		    writeout "Alert: the --del-dir argument syntax is incorrect, use [+-][N][d]"
+		    writeout "Where:"
+		    writeout "- The first character [+] means older than, or [-] newer than"
+		    writeout "- N stands for the number of days to consider, up to 999"
+		    writeout "- The last character indicates the interval (d for days)"
+		    drawline
+	        else
+	    	    if [ "$SERVERTYPE" = "DIR" ]
+	    	    then
+	    	    	if [ "$backupprog" == "xsitools" ]
+	    	    	then
+		    	    rootdeldir="$( dirname "${backuppoint}" )"
+	    	    	else
+		    	    rootdeldir="${backuppoint}"
+	    	    	fi
+	    	    else
+	    	   	rootdeldir="$( echo "${backuppoint}" | awk -F ':' '{print $3}' )" 
+	    	        if [ "$backupprog" == "xsitools" ]
+	    	        then
+	    	            rootdeldir="$( dirname "${backuppoint}" )"	
+	    	        fi
+	    	    fi
+		    if [ "${#rootdeldir}" -gt "0" ]
+		    then	
+	    	    	rmremdir "${rootdeldir}" "$deldirs"
+	            fi
+	        fi
+	    fi
+	else
+	    if [ "$APPNAM" == "XSIBACKUP-FREE" -a "$deldirs" != "" ]
+	    then
+	    	up2Pro "Deletion of old directories"
+	    fi	
+	fi
+fi
+
+if [ "$SERVERTYPE" = "DIR" ]
+then
+    AVAILA_ROOM=$(( $(avail_backup_room $backuppoint)/1024 ))
+    vmlistHTMLStr=$vmlistHTMLStr"<tr>\r\n
+        <td colspan=\"8\">Available space in device $backuppoint after backup: "$AVAILA_ROOM" Gb.</td>\r\n
+	</tr>\r\n"
+fi	
+vmlistHTMLStr=$vmlistHTMLStr"<tr>\r\n 
+ <td colspan=\"8\">Complete backup elapsed time: "$(($DIFFALL/60))" min</td>\r\n
+ </tr>\r\n"
+
+if [ "$onerror" != "" -o "$onsuccess" != "" ]
+then
+	if [ "$onerror" != "" ]
+	then
+		vmlistHTMLStr=$vmlistHTMLStr"<tr>\r\n 
+		 <td colspan=\"8\">Chained backup --on-error: ${onerror}</td>\r\n
+		 </tr>\r\n" 
+	fi
+	if [ "$onsuccess" != "" ]
+	then
+		vmlistHTMLStr=$vmlistHTMLStr"<tr>\r\n 
+		 <td colspan=\"8\">Chained backup --on-success: ${onsuccess}</td>\r\n
+		 </tr>\r\n" 
+	fi	
+fi
+ 
+if [ "$backupprog" == "xsitools" ] && [ "$checkrepo" == "yes" -o "$checkrepo" == "vms" -o "$checkrepo" == "full" ]
+then
+    rm -rf /tmp/checkRepoHTML.tmp > /dev/null 2>&1
+    IFS=$newline
+    for VM2CHK in $LISTA2
+    do
+    	VMID2CHK=$( echo $VM2CHK | awk '{ print $1 }' )
+    	VMNAM2CHK=$( getVMName $VMID2CHK )
+    	VMSCHCKED="${VMSCHCKED} | ${VMNAM2CHK}"
+        if [ "$checkrepo" == "yes" -o "$checkrepo" == "vms" ]
+        then
+            xsiBackupPoint=$( ls -1rd "${backuppoint}/${newdirmask}" | head -n1 )
+            if [ -d "$xsiBackupPoint"/"$VMNAM2CHK" ]
+            then
+                xsiTools check "$xsiBackupPoint"/"$VMNAM2CHK"
+            else
+                writeout "Cannot locate XSITools repo path: $xsiBackupPoint/$VMNAM2CHK"
+                drawline	
+            fi
+        elif [ "$checkrepo" == "full" ]
+        then
+            if [ -d "${backuppoint}" ]
+            then
+                xsiTools check "${backuppoint}"
+            else
+            	writeout "Cannot locate XSITools repo path: ${backuppoint}"
+            	drawline
+            fi	
+        else
+            writeout "The --check-repo argument only accepts (yes|vms|full)"
+            drawline
+        fi
+    done
+    IFS=$OLDIFS
+    if [ "$CHECKRESULT" == "KO" ]
+    then
+	chkclass="red"
+	ERR XSICHKR1 "The XSITools Repo check failed"
+    else
+        chkclass="green"
+    fi
+    VMSCHCKED="${VMSCHCKED:3}"
+    if [ -f /tmp/checkRepoHTML.tmp ]
+    then
+    	checkRepoHTML=$( cat /tmp/checkRepoHTML.tmp )
+    	rm -rf /tmp/checkRepoHTML.tmp
+    fi
+    vmlistHTMLStr=$vmlistHTMLStr"<tr>\r\n
+        <td colspan=\"8\" class=\""$chkclass"\">Check performed on XSITools repo: <b>$backuppoint</b><br>VMs checked:($VMSCHCKED)<br><hr />$checkRepoHTML</td>\r\n
+        </tr>\r\n"
+fi
+
+if [ "$testmode" != "true" ]
+then
+    if [ -f "$PWD"/src/pro/esxbackup ]
+    then
+    	# Backup ESXi server configuration
+		if [ "$datedir" == "yes" ] && [ "$SERVERTYPE" == "DIR" ]
+    	then
+			backConfPath="${backuppoint}/${newdirmask}"
+            backConfResult="$( backupConfig "${backConfPath}" )"
+    	else
+       	    backConfPath="$backuppoint"
+       	    backConfResult="$( backupConfig "${backConfPath}" )"
+    	fi
+
+    	if [ "$backConfResult" == "1" ]
+    	then
+	    writeout "The ESXi configuration was saved to \"$backConfPath\""
+	    drawline
+	    vmlistHTMLStr=$vmlistHTMLStr"
+	    <tr>\r\n
+ 	    <td colspan=\"8\">The ESXi configuration was saved to $backConfPath</td>\r\n
+	    </tr>\r\n"
+    	else
+       	    writeout -e "\033[0;31mError backing the ESXi host config to $backConfPath\033[0m"
+       	    drawline
+       	    ERR BAKESXCF "Error: backing the ESXi host config to $backConfPath, details: $backConfResult"
+    	fi
+    	# End of Backup ESXi server configuration
+    else
+    	if [ "$APPNAM" == "XSIBACKUP-FREE" ]
+    	then
+            up2Pro "Backup of ESXi configuration"
+    	    up2ProHTML="$( up2Pro "Backup of ESXi configuration" "HTM" )"	    
+            vmlistHTMLStr=$vmlistHTMLStr"
+            <tr>\r\n
+             <td colspan=\"8\">$up2ProHTML</td>\r\n
+            </tr>\r\n"
+	fi    	
+    fi
+    
+    if [ "$debuginfo" == "yes" ]
+    then
+        echo "Adding debug information to the report"
+        vmlistHTMLStr=$vmlistHTMLStr"
+        <tr>\r\n
+        <td colspan=\"8\"><b>DEBUG INFORMATION:</b><br>$DEBUGINFO</td>\r\n
+        </tr>\r\n"
+    fi
+fi
+
+IFS=","
+for email in $mailto
+do
+    if [ "$( isEmail ${email} )" == "0" ]
+    then
+    	writeout "\033[0;31m[${email}] excluded from the e-mail recipient list, not evaluable as an e-mail address\033[0m"
+    	$( ERR 2188 "<b>${email}</b> excluded from the e-mail recipient list, not evaluable as an e-mail address" "W" )
+    fi
+done
+IFS=$OLDIFS
+
+cmd64=$( echo $@ | openssl base64 2>/dev/null )
+ERR_FILE_SIZE="0"
+if [ -f "${errfileb}" ]
+then
+    ERR_FILE_SIZE=$( ls -la "${errfileb}" 2>/dev/null | awk '{print $5}' 2>/dev/null )
+    ERRORS="0"
+    WARNINGS="0"
+    if [ "$ERR_FILE_SIZE" -gt "0" ]
+    then
+    	ERR_STR=$( cat "${errfileb}" | grep -v "WARNING" | sed -e 's/^ *//g' -e 's/ *$//g' | sort -u )
+    	if [ "$ERR_STR" != "" ]
+    	then
+	    ERRORS="1"
+	    writeout "\033[0;31mErrors detected in backup, check logs\033[0m"
+	    drawline
+            vmlistHTMLStr=$vmlistHTMLStr"
+            <tr>\r\n
+                <td colspan=\"8\">&bull;&nbsp;${ERR_STR//$newline/<br>&bull;&nbsp;}</td>\r\n
+            </tr>\r\n"    	
+	fi
+    	WRN_STR=$( cat "${errfileb}" | grep "WARNING" | sed -e 's/^ *//g' -e 's/ *$//g' | sort -u )
+    	if [ "$WRN_STR" != "" ]
+    	then
+	    WARNINGS="1"
+	    writeout "\033[0;36mSome warnings were raised\033[0m"
+	    drawline
+            vmlistHTMLStr=$vmlistHTMLStr"
+            <tr>\r\n
+                <td colspan=\"8\">&bull;&nbsp;${WRN_STR//$newline/<br>&bull;&nbsp;}</td>\r\n
+            </tr>\r\n"
+	fi
+    else
+    	writeout "\033[0;32mNo errors detected in backup\033[0m"
+    	drawline
+    fi
+fi
+
+if [ -f "$PWD"/src/pro/events -a "$APPNAM" == "XSIBACKUP-PRO" ]
+then
+    . "$PWD"/src/pro/events
+else
+    if [ "$APPNAM" == "XSIBACKUP-FREE" ]
+    then
+        if [ "$onerror" != "" -o "$onsuccess" != "" ]
+        then
+            up2Pro "Event handling"
+        fi
+    fi
+fi
+
+if [ "$subject" != "" ]
+then
+    personalsubject="$subject"	
+elif [ "$description" != "" ]
+then
+    personalsubject="$description"
+fi
+
+if [ "$ERRORS" -eq "0" -a "$WARNINGS" -eq "0" ]
+then
+    asubject="=?utf-8?Q?=E2=9C=94_XSIBACKUP_no_errors_detected_in_backup_job?="
+elif [ "$ERRORS" -gt "0" ]
+then
+    asubject="=?utf-8?Q?=E2=9C=96_XSIBACKUP_errors_detected_in_backup_job!!?="	
+elif [ "$WARNINGS" -gt "0" ]
+then
+    asubject="(!) XSIBACKUP some warnings were raised"
+else
+    asubject="=?utf-8?Q?=E2=9C=94_XSIBACKUP_no_errors_detected_in_backup_job?="
+fi
+
+if [ "$personalsubject" != "" ]
+then
+    subject="$asubject | $personalsubject"	
+else
+    subject="$asubject"
+fi
+
+vmlistHTMLStr=$vmlistHTMLStr"</table>\r\n"
+
+emailHTMLStr="$( echo -e ${headHTMLStr}${stylesHTMLStr}${logosHTMLStr}${bannerHTMLStr}${hostipHTMLStr}${vmlistHTMLStr}"<br><br>"${smartinfo} )"
+
+# We write the footer of the e-mail
+emailHTMLStr=$emailHTMLStr"</body></html>"
+
+# If we have set a custom template we process it here
+
+if [ "$skin" != "" ]
+then
+        skindir=".xsibackup-skins"
+        skinext=".xsiskin"
+        
+        if [ ! -d ${pwd}"$skindir" ]
+        then
+                mkdir "$skindir"
+        fi	
+	
+	if [ "${skin:0:7}" == "http://" ]
+	then	
+		theskin=$( wget -qO- "$skin" )
+		# Lets replace the images
+		i=0
+		IFS=","
+		for imgx in $imglist
+		do
+			imgvar="img"${i}
+			eval "echo $imgvar"		
+		i=$(( $i + 1 ))
+		done
+		IFS=$OLDIFS
+		exit 0	
+	else
+		if [ -e "$skin" ]
+		then
+			echo "We got a local file"
+		fi
+	fi
+fi
+
+# We send the e-mail
+if [ "$SEND_EMAIL" == "1" ]
+then
+    
+    #emailHTMLStr="$( eval $emailHTMLStr )"
+    if [ "$usesmtp" -eq "$usesmtp" -a "$usesmtp" -gt "0" ] 2>/dev/null
+    then
+    	sendMail "$mailto" "$subject" "${emailHTMLStr}" "$usesmtp"
+    else
+    	sendMail "$mailto" "$subject" "${emailHTMLStr}" "0" "$smtpsrv" "$smtpport" "$mailfrom" "$smtpusr" "$smtppwd" "$smtpauth" "$smtpsec" "$smtpdelay"
+    fi	
+
+fi
+
+if [ "$VMOTIONVNIC" != "" ]
+then
+    enableVMotion	
+fi
+
+writeout "\033[0;32mBackup finished\033[0m"
+if [ ${#next} -gt 0 ]
+then
+    next="${next}"
+    writeout "Executing next chained backup ID($backupId)"
+    drawline
+    writeout "Next job: ${next//#/}"
+    drawline
+    eval "${next//#/}" >> "${PWD}/xsibackup-cron.log"
+else
+    writeout "\033[0;36mTip: no chained backups scheduled, set --on-success and/or --on-error arguments to chain a backup\033[0m"
+    drawline
+fi
+echo "XSIBACKUP_EXIT_STATUS=$ERR_FILE_SIZE"
+xsib_shutdown
+drawline
+}

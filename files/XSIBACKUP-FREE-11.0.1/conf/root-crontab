@@ -1,0 +1,6 @@
+# This crontab belongs to the root user, thus it starts by root-
+# Add cron jobs to this file in the classic crond Linux way. 
+# This is an example of a backup job being run everyday at 2:00 a.m.
+# change according to your needs and run ./xsibackup --update-cron
+# min hour day mon dow command
+# 0 2 * * * "/vmfs/volumes/datastore1/xsi-dir/jobs/001"
