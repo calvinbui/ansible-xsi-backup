@@ -76,4 +76,4 @@
   shell: "{{ xsibackup_working_dir }}/xsibackup/xsibackup --install-cron --exec=yes"
   register: result
   changed_when: "'successfully' in result.stdout"
-  failed_when: "result.stderr != -9"
+  failed_when: "result.rc != -9"
