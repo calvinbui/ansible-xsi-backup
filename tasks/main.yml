@@ -62,7 +62,7 @@
     - Update crontab
 
 - name: Install crontab
-  shell: {{ xsibackup_working_dir }}/xsibackup/xsibackup --install-cron
+  shell: "{{ xsibackup_working_dir }}/xsibackup/xsibackup --install-cron"
   args:
     executable: /bin/sh
   register: result
