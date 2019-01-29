@@ -62,8 +62,9 @@
     - Update crontab
 
 - name: Install crontab
-  command: xsibackup --install-cron
+  shell: xsibackup --install-cron
   args:
     chdir: "{{ xsibackup_working_dir }}/xsibackup"
+    executable: /bin/sh
   register: result
-  changed_when: "'successfully installed' in result.stdout"
+  changed_when: "'successfully' in result.stdout"
