@@ -29,15 +29,18 @@
     state: link
     force: true
 
-- name: Apply permissions for XSIBackup execution
+- name: Apply permissions for XSIBackup folders
   file:
-    path: "{{ item }}"
+    path: "{{ item.path }}"
     mode: 0700
-    recurse: true
+    recurse: "{{ item.recurse }}"
   loop:
-    - "{{ xsibackup_working_dir }}/xsibackup/xsibackup"
-    - "{{ xsibackup_working_dir }}/xsibackup/src"
-    - "{{ xsibackup_working_dir }}/xsibackup/bin"
+    - path: "{{ xsibackup_working_dir }}/xsibackup/xsibackup"
+      recurse: false
+    - path: "{{ xsibackup_working_dir }}/xsibackup/src"
+      recurse: true
+    - path: "{{ xsibackup_working_dir }}/xsibackup/bin"
+      recurse: true
 
 - name: Create XSIBackup jobs
   template:
