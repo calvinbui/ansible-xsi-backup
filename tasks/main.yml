@@ -36,7 +36,7 @@
   loop:
     - "{{ xsibackup_working_dir }}/xsibackup/xsibackup"
     - "{{ xsibackup_working_dir }}/xsibackup/src"
-    - "{{ xsibackup_working_dir }}/xsibackup/bin"
+    - "{{ xsibackup_working_dir }}/xsibackup/bin/*"
 
 - name: Create XSIBackup jobs
   template:
