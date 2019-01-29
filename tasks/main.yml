@@ -16,6 +16,12 @@
     dest: "{{ xsibackup_working_dir }}/xsibackup-{{ xsibackup_version }}"
     force: no
 
+- name: Mark EULA as read
+  lineinfile:
+    path: "{{ xsibackup_working_dir }}/xsibackup/EULA"
+    regexp: "^read="
+    line: "read=1"
+
 - name: Symlink XSIBackup directory to versioned folder
   file:
     src: "{{ xsibackup_working_dir }}/xsibackup-{{ xsibackup_version }}"
