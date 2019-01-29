@@ -1,4 +1,4 @@
 ---
 
 - name: Update crontab
-  command: "{{ xsibackup_working_dir }}/xsibackup/xsibackup --update-cron"
+  shell: "{{ xsibackup_working_dir }}/xsibackup/xsibackup --update-cron --exec=yes"
