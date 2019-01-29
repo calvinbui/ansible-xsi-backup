@@ -1,0 +1,6 @@
+---
+
+- name: Update crontab
+  command: xsibackup --update-cron
+  args:
+    chdir: "{{ xsibackup_working_dir }}/xsibackup"

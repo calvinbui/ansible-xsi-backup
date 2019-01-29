@@ -1,0 +1,70 @@
+---
+
+- name: Create XSIBackup directories
+  file:
+    path: "{{ item }}"
+    state: directory
+  loop:
+    - "{{ xsibackup_working_dir }}"
+    - "{{ xsibackup_working_dir }}/xsibackup"
+    - "{{ xsibackup_working_dir }}/xsibackup-{{ xsibackup_version }}"
+    - "{{ xsibackup_backup_dir }}"
+
+- name: Extract XSIBackup {{ xsibackup_version }} archive on target
+  unarchive:
+    src: "XSIBACKUP-FREE-{{ xsibackup_version }}.zip"
+    dest: "{{ xsibackup_working_dir }}/xsibackup-{{ xsibackup_version }}"
+    creates: "{{ xsibackup_working_dir }}/xsibackup-{{ xsibackup_version }}/xsibackup"
+
+- name: Symlink XSIBackup directory to versioned folder
+  file:
+    src: "{{ xsibackup_working_dir }}/xsibackup-{{ xsibackup_version }}"
+    dest: "{{ xsibackup_working_dir }}/xsibackup"
+    state: link
+    force: true
+
+- name: Apply permissions for XSIBackup execution
+  file:
+    path: "{{ item }}"
+    mode: 0700
+  loop:
+    - "{{ xsibackup_working_dir }}/xsibackup/xsibackup"
+    - "{{ xsibackup_working_dir }}/xsibackup/src"
+    - "{{ xsibackup_working_dir }}/xsibackup/bin"
+
+- name: Create XSIBackup jobs
+  template:
+    src: "{{ item.name }}.j2"
+    dest: "{{ xsibackup_working_dir }}/xsibackup/jobs/{{ item.name }}"
+    mode: 0700
+  loop: "{{ xsibackup_jobs|flatten(levels=1) }}"
+
+- name: Add jobs to XSIBackup crontab
+  lineinfile:
+    path: "{{ xsibackup_working_dir }}/xsibackup/conf/root-crontab"
+    regexp: ".*jobs/{{ item.name }}\"$"
+    line: "{{ item.cron }} \"{{ xsibackup_working_dir }}/xsibackup/jobs/{{ item.name }}\""
+  loop: "{{ xsibackup_jobs|flatten(levels=1) }}"
+  notify:
+    - Update crontab
+
+- name: Copy clean-backup script
+  copy:
+    src: clean-backups.py
+    dest: "{{ xsibackup_working_dir }}"
+    mode: 0700
+
+- name: Add clean-backup script to crontab
+  lineinfile:
+    path: "{{ xsibackup_working_dir }}/xsibackup/conf/root-crontab"
+    regexp: "clean-backups.py"
+    line: "{{ xsibackup_cleaner.cron }} /bin/python '{{ xsibackup_working_dir }}/clean-backups.py' -p {{ xsibackup_backup_dir }} -r 'backup*' -k {{ xsibackup_cleaner.days_to_keep }}"
+  notify:
+    - Update crontab
+
+- name: Install crontab
+  command: xsibackup --install-cron
+  args:
+    chdir: "{{ xsibackup_working_dir }}/xsibackup"
+  register: result
+  changed_when: '"The root user crontab has been successfully installed" in result.stdout'

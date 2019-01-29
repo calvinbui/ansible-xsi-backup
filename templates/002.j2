@@ -1,0 +1,9 @@
+{{ xsibackup_working_dir }}/xsibackup/xsibackup \
+--description="XSITools backup of VMs" \
+--backup-id=002 \
+--backup-point={{ xsibackup_backup_dir }}/backup-$(date -I) \
+--backup-how=hot \
+--backup-type=custom \
+--snapshot=doquiesce \
+--backup-vms="awx,unifi,confluence,download,nut,blueiris!milestone.vmdk" \
+--exec=yes >> {{ xsibackup_working_dir }}/xsibackup/var/logs/cron.log
