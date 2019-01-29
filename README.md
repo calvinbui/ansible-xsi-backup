@@ -1,5 +1,3 @@
-[![Build Status](https://travis-ci.com/calvinbui/ansible-xsibackup.svg?branch=master)](https://travis-ci.com/calvinbui/ansible-xsibackup)
-
 # Ansible XSIBackup
 
 Installs XSIBackup on ESXi and configures cron jobs
