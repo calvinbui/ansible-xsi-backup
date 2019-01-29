@@ -14,6 +14,7 @@
   copy:
     src: "XSIBACKUP-FREE-{{ xsibackup_version }}/"
     dest: "{{ xsibackup_working_dir }}/xsibackup-{{ xsibackup_version }}"
+    force: no
 
 - name: Symlink XSIBackup directory to versioned folder
   file:
