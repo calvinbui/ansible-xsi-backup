@@ -44,7 +44,7 @@
 
 - name: Create XSIBackup jobs
   template:
-    src: "{{ item.name }}.j2"
+    src: "{{ item.name }}"
     dest: "{{ xsibackup_working_dir }}/xsibackup/jobs/{{ item.name }}"
     mode: 0700
   loop: "{{ xsibackup_jobs|flatten(levels=1) }}"
