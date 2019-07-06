@@ -1,0 +1,1310 @@
+xsiTools(){
+
+DDBIN="dd"
+#DDBIN="$PWD/bin/dd"
+OSBIN="openssl"
+#LZBIN="$PWD/bin/lzop"
+LZBIN="lzop"
+
+if [ "$1" == "backup" -o "$1" == "copy" ]
+then
+    if [ "$4" != "" -a "${#4}" -lt "5" ]
+    then
+    	blocksize="$( echo "$4" | awk '{print tolower($0)}' )"
+    	if [ "$blocksize" == "auto" ]
+    	then
+    	    if [ "$1" == "check" ]
+    	    then
+    	    	echo "The blocksize set for the repository will be used to check it"	
+    	    else
+    	    	BLOCKSIZE=52428800
+    	    fi
+    	else
+	    BADB=0
+	    if [ "${#blocksize}" -ne "3" ]
+	    then
+	    	BADB=1	
+	    fi
+	    if [ "${blocksize:2:1}" != "m" ]
+	    then
+	    	BADB=1
+	    fi
+	    BS="${blocksize//m/}"
+	    if [ "$BS" -ne "10" -a "$BS" -ne "20" -a "$BS" -ne "50" ]
+	    then
+	    	BADB=1
+	    fi
+	    if [ "$BADB" == "1" ]
+	    then
+	    	writeout "$4 is not an allowed block size, allowed ( 10M, 20M, 50M[default] ). Default (50M) will be applied."
+    	    	BLOCKSIZE=52428800
+    	    else
+    	    	BLOCKSIZE=$(( $BS*1024*1024 ))		
+    	    fi    
+    	fi	
+    else
+    	BLOCKSIZE=52428800
+    fi
+fi
+
+SHA1ZERO=$( getSha1Zero "$BLOCKSIZE" )
+
+if [ "$1" == "backup" ]
+then
+    writeout "Blocksize is $BLOCKSIZE bytes"
+    drawline
+fi
+
+if [ "$1" == "check" ]
+then
+    repopath="${2%/}"
+    if [ -d "$repopath"/data -a -f "$repopath"/.xsitools -a "$( cat "$repopath"/.xsitools 2>/dev/null | grep "XSITools Repo" | wc -l )" -eq "1" ]
+    then
+        writeout "<$repopath> is an (c)XSITools repo"
+        drawline
+        repotype="fullrepo"
+    elif [ "$( ls -1 "$repopath"/*.vmdk.info | wc -l )" -gt "0" ]
+    then
+    	writeout "<$repopath> is an (c)XSITools repo VM directory"
+    	drawline
+    	repotype="repovdir"
+    else
+    	writeout "<$repopath> is not an (c)XSITools repository"
+    	drawline
+    	writeout "<$repopath> is not an (c)XSITools VM folder either"
+    	drawline
+    	exit 33
+    fi 
+
+    STARTCHECK=$(date +%s)	
+   
+    echo "Checking XSITools Repo: "
+    drawline 
+    if [ "$repotype" == "fullrepo" ]
+    then
+    	blockn=$( find "$repopath"/data -type f -maxdepth 4 -regex '.*/[a-f0-9]*' | wc -l )
+    	brecrd=$( cat "$repopath"/.xsitools | grep Bcnt | awk -F ': ' '{print $2}' )
+    	blsize=$( cat "$repopath"/.xsitools | grep Bsiz | awk -F ': ' '{print $2}' )
+    	blcomp=$( cat "$repopath"/.xsitools | grep Comp | awk -F ': ' '{print $2}' )
+	if [ "$blockn" -ne "$brecrd" ]
+	then
+	    writeout "\033[1;31mBlock count mistmatch: $blockn physical, $brecrd registered file\033[0m"
+	    CHKERRS="Block count mistmatch: $blockn count, $brecrd at .xsitools file"
+	    CHKRSLT="KO"
+	    if [ "$blockn" -gt "$brecrd" ]
+	    then
+	    	writeout "Do not panic, the number of blocks on disk is greater than the registered amount"
+	    	writeout "This can be due to a previous backup having been interrupted"
+	    	writeout "You can check your VMs individually to make sure they are complete"
+	    	CHKERRS="$CHKERRS${newline}Do not panic, the number of blocks on disk is greater than the registered amount.${newline}This can be due to a previous backup having been interrupted"
+	    else
+	    	writeout "\033[1;31mNumber of registered blocks is greater than physical blocks in the repo\033[0m"
+	    	writeout "\033[1;31mThis means that some blocks have been deleted, wait for more detailed messages\033[0m"
+	    	CHKERRS="$CHKERRS${newline}Number of registered blocks is greater than physical blocks in the repo.${newline}This means that some blocks have been deleted, wait for more detailed messages"
+	    fi
+	    drawline
+	else
+	    echo -e "Physical count $blockn equals $brecrd registered blocks at .xsitools file"
+	fi
+	crp=1
+	failedblockchecks=0
+	badblocksdetected=""
+	IFS=$newline
+	theblocks=$(find "$repopath"/data -type f -maxdepth 4 -regex '.*/[a-f0-9]*' -exec printf '%s\n' {} \;)
+	for ifile in $theblocks
+	do
+	    if [ "$4" == "f" ]
+	    then
+            	if [ -f "${ifile}" ]
+            	then
+            	    COND1="1"
+                    COND2="1"
+                else
+                    COND1="1"
+                    COND2="0"
+                    echo "Missing block: <${ifile}>"
+                fi			    	
+	    else
+	    	if [ "$blcomp" -eq "1" ]
+	    	then
+	            COND1=$( "$LZBIN" -d -c "${ifile}" | "$OSBIN" sha1 2>/dev/null | grep -Eo "[0-9a-f]{40}" )
+	    	else
+	            COND1=$( "$OSBIN" sha1 "${ifile}" 2>/dev/null | grep -Eo "[0-9a-f]{40}" )
+	    	fi
+	    	COND2=$( basename ${ifile} )
+	    fi
+	    if [ "$COND1" != "$COND2" ]
+	    then
+	        failedblockchecks=$(( $failedblockchecks+1 ))
+	        badblocksdetected=${badblocksdetected}${newline}$COND2
+	        echo "Bad block detected: $COND2"
+	        if [ "$delbadblocks" == "yes" ]
+	        then
+	            mv "${ifile}" "${ifile}.rem" && CHKERRS="$CHKERRS${newline}Bad block ${ifile} deleted"
+	        fi
+	    fi
+	    echo -ne "${crp}/${blockn} blocks | Processed $(( $crp*100/$blockn ))%\033[0K\r"
+	crp=$(( $crp+1 ))
+	done
+	IFS=$OLDIFS
+	printf '%s\n'
+
+    elif [ "$repotype" == "repovdir" ]
+    then
+        restorefiles=$( ls -1 "$repopath"/*-flat.vmdk )
+        writeout "XSIBackup will only check the VM folder: $repopath"
+        writeout "This are the deduplicated data files to check:"
+        drawline
+        writeout "\033[1;32m$restorefiles\033[0m"
+       	drawline
+       	blockn=0
+        theblocks=""
+        IFS=$newline
+        for restorefile in $restorefiles
+        do
+      	    bn=$( cat "$restorefile" | wc -l )
+      	    tb=$( cat "$restorefile" | sort -u )
+      	    blockn=$(( $blockn+$bn ))
+      	    theblocks=${theblocks}${tb}${newline}	  
+        done
+        IFS=$OLDIFS
+
+	theblocks=$( echo "$theblocks" | sed '/^$/d' | sort -u )
+	blockn=$( echo "$theblocks" | wc -l )
+
+        blsize=$( cat "$repopath"/../../.xsitools | grep Bsiz | awk -F ': ' '{print $2}' )
+        blcomp=$( cat "$repopath"/../../.xsitools | grep Comp | awk -F ': ' '{print $2}' )    
+	failedblockchecks=0
+	crp=1
+	IFS=$newline
+	
+	for line in $theblocks
+	do
+	    if [ "$line" != "$SHA1ZERO" ]
+	    then
+	   	blockpath="$repopath"/../../data/${line:0:1}/${line:1:1}/${line:2:1}/$line	
+            	if [ -f "$blockpath" ]
+            	then
+            	    if [ "$4" == "f" ]
+            	    then
+            	   	COND1="1"
+            	   	COND2="1"
+            	    else
+            	    	if [ "$blcomp" -eq "1" ]
+            	    	then
+                            COND1=$( "$LZBIN" -d -c "${blockpath}" | "$OSBIN" sha1 2>/dev/null | grep -Eo "[0-9a-f]{40}" )
+            	    	else
+                            COND1=$( "$OSBIN" sha1 "${blockpath}" 2>/dev/null | grep -Eo "[0-9a-f]{40}" )
+            	    	fi
+            	    	COND2=$line
+            	    fi
+            	    if [ "$COND1" != "$COND2" ]
+            	    then
+                        failedblockchecks=$(( $failedblockchecks+1 ))
+                        badblocksdetected=${badblocksdetected}${newline}$COND2
+                        echo "Bad block detected: $COND2"
+                        if [ "$delbadblocks" == "yes" ]
+                        then
+                       	    mv "${blockpath}" "${blockpath}.rem" && CHKERRS="$CHKERRS${newline}Bad block ${blockpath} deleted"
+            		fi
+            	    fi
+            	else
+            	    failedblockchecks=$(( $failedblockchecks+1 ))
+            	    badblocksdetected=${badblocksdetected}${newline}$line
+		    CHKERRS="$CHKERRS${newline}Block $line is missing"
+		    CHKRSLT="KO"            			
+            	fi
+	        echo -ne "${crp}/${blockn} blocks | Processed $(( $crp*100/$blockn ))%\033[0K\r"
+	    fi
+	crp=$(( $crp + 1 ))
+	done
+	IFS=$OLDIFS
+	printf '%s\n'
+    else
+	writeout "The path $repopath is not an XSITools repo nor a XSITools VM directory"
+	exit 33    
+    fi
+    
+    ENDCHECK=$(date +%s)
+    CHECKTIME=$(( $ENDCHECK - $STARTCHECK ))
+
+    if [ "$failedblockchecks" -eq "0" ]
+    then
+        CHKERRS="$CHKERRS${newline}No errors detected"
+        CHKRSLT="OK"
+    else
+        CHKERRS="$CHKERRS${newline}$failedblockchecks bad blocks detected${newline}${badblocksdetected}"
+        CHKRSLT="KO"
+    fi
+    CHKERRS=$( echo "$CHKERRS" | sort -u )
+    writeout "$CHKERRS"	
+    drawline
+
+    CHKRESUHTML="<b>"$APPNAM" "$APPVER" | "$APPCOM"</b><br>Checking XSITools repository "$repopath"<br>Time taken: "$CHECKTIME" seconds<br>"
+    IFS=${newline}
+    for chkline in $CHKERRS
+    do
+    	CHKRESUHTML="$CHKRESUHTML$chkline<br />"
+    done	
+    IFS=$OLDIFS
+   
+    CHECKRESULT="$CHKRSLT"
+
+    checkRepoHTML="
+            XSIBACKUP XSITOOLS REPO CHECK:<br />
+            "$CHKRESUHTML
+            
+    echo "$checkRepoHTML<hr />" >> /tmp/checkRepoHTML.tmp
+            
+    
+    if [ "$( isEmail ${3} )" == "1" ]
+    then
+    	checkRepoHTML="<!DOCTYPE html PUBLIC '-//W3C//DTD XHTML 1.0 Strict//EN' 'http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd'>
+    	<html>
+            <head>
+            <title>XSIBACKUP "$APPVER" TEST E-MAIL</title>
+            <style type="text/css">
+           	body {
+               	font-family: arial;
+               	font-size: 17px;
+               	font-weight: 400;
+               	}
+            </style>
+            </head>
+            <body>
+            	"$checkRepoHTML"
+            </body>
+    	</html>"
+    	
+    	sendMail "$3" "XSIBACKUP XSITOOLS REPOSITORY CHECK | $CHKRSLT" "$checkRepoHTML" 1
+    fi
+
+elif [ "$1" == "backup" ]
+then
+    if [ ! -f "$2" ]
+    then
+        writeout "File <$2> does not exist"
+        exit 33
+    else
+        FILEPATH="$2"
+        DESCRIPT="${FILEPATH/-flat.vmdk/.vmdk}"
+        DESCFILE=$( basename "$DESCRIPT" )
+        NOEXTMAP="$( vmkfstools -t0 "${DESCRIPT}" 2>&1 | head -n1 | grep "Failed to get physical mapping" | wc -l )"
+        if [ "${NOEXTMAP}" -eq "0" ]
+        then
+            EXTENTMP="$( vmkfstools -t0 "${DESCRIPT}" | sed '/Mapping for file/d' | awk -F ' -- ' '{print $1}' | sed -e 's/^\[//g' -e 's/\] --> \[/:/g' -e 's/ //g' | sed '/^$/d' > "${DESCRIPT}.extents" )"
+            if [ "$EXTENTMP" != "" ]
+	    then
+		writeout "Error: cannot generate extent map of <$DESCRIPT>"
+		ERR XSITEX01 "XSITools error: cannot generate extent map of <$DESCRIPT>"		
+	    fi
+	else
+            echo "NON VMFS" > "${DESCRIPT}.extents"
+            writeout "No extent map present, your VM is hosted in a non VMFS volume"
+            drawline	
+            EXTENTMP="0"
+        fi
+
+        FILENAME=$( basename "$2" )
+        FILESIZE=$( ls -las "$FILEPATH" | awk '{print $6}' )
+        DISKUSAG=$( du "$FILEPATH" | awk '{print $1}' )
+        DISKUSAG=$( python -c "print($DISKUSAG*1024)" )
+        BLOCKCNT1=$( python -c "print(int($FILESIZE/$BLOCKSIZE))" )
+        BLOCKCNT2=$( python -c "print($FILESIZE/float($BLOCKSIZE))" )
+        COMPBOOLE=$( python -c "print($BLOCKCNT1 == $BLOCKCNT2)" )
+        COMPBOOLE=$( echo "$COMPBOOLE" | awk '{print tolower($0)}' )
+        if [ "$COMPBOOLE" == "true" ]
+        then
+            BLOCKCNT=$BLOCKCNT1
+        else
+            BLOCKCNT=$(( $BLOCKCNT1+1 ))
+        fi
+    fi
+
+    if [ "${5//z/}" != "${5}" ]
+    then
+        compression=1
+        writeout "Compression has been set"
+    	drawline
+    else
+        compression=0
+    fi
+
+    SUBBLKSIZ=1048576
+    SUBBLKCNT=$(( $BLOCKSIZE/$SUBBLKSIZ ))
+
+    if [ "$( isRemotePath "$3" )" -eq "1" ]
+    then    	
+
+	IP="$( echo "$3" | awk -F ':' '{print $1}' )"
+	PO="$( echo "$3" | awk -F ':' '{print $2}' )"
+	PA="$( echo "$3" | awk -F ':' '{print $3}' )"
+
+        RTTARGET=$( dirname $( dirname "$PA" ) )
+        DTTARGET="$RTTARGET"/data
+        HASHTABLE="$PA"/"$FILENAME"
+        INFOFILEP="$HASHTABLE.info"	
+
+	REPOHEAD="Desc: XSITools Repo v 1.1.0\nBsiz: ${BLOCKSIZE}\nBcnt: 0\nComp: ${compression}"
+        echo -e "$REPOHEAD" > /tmp/.repohead	
+      	
+      	MKREPO1="$( eval ssh "$SSHOPTS" -p ${PO} ${defremusr}@${IP} "mkdir -p \"$DTTARGET\"" )"
+	if [ "$?" -ne "0" ]
+	then
+	    echo "XSITools error: could not create remote dir <$DTTARGET>"
+	    ERR XSITDT01 "XSITools error: could not create remote dir <$DTTARGET>"
+	fi
+	MKREPO2="$( cat "/tmp/.repohead" | eval ssh "${SSHOPTS}" -p ${PO} ${defremusr}@${IP} "if \[ ! -f \"$RTTARGET/.xsitools\" \]\;then cat \> \"$RTTARGET/.xsitools\"\;else echo EXISTS \;fi" )"
+        if [ "$?" -ne "0" ]
+        then
+            echo "XSITools error: could not create remote .xsitools file at <$RTTARGET>"
+            ERR XSITDT02 "XSITools error: could not create remote .xsitools file at <$RTTARGET>"
+        fi
+        if [ "${MKREPO2}" == "EXISTS" ]
+        then
+            REPOCOMP=$( ( eval ssh "${SSHOPTS}" -p ${PO} ${defremusr}@${IP} "cat \"$RTTARGET/.xsitools\" | grep Comp | awk -F ': ' '{print \$2}'" ) 2>&1 )
+            if [ "$REPOCOMP" -ne "$compression" ]
+            then
+            	if [ "$compression" == "0" ]
+            	then
+                    writeout "XSITools Error: this is a compressed repository, you must enable compression to backup to it"
+                    drawline
+            	else
+                    writeout "XSITools Error: this is an uncompressed repository, you cannot backup to it with compression enabled"
+                    drawline
+            	fi
+            	exit 33
+            fi
+        fi	
+	MKREPO3="$( eval ssh "$SSHOPTS" -p ${PO} ${defremusr}@${IP} "mkdir -p \"$PA\"" )"
+        if [ "$?" -ne "0" ]
+        then
+            echo "XSITools error: could not create remote dir <$PA>"
+            ERR XSITDT03 "XSITools error: could not create remote dir <$PA>"
+        fi	
+	rm -rf /tmp/.repohead
+
+	echo -e "fsize: $FILESIZE\nusage: $DISKUSAG\nbsize: $BLOCKSIZE\nbcomp: $compression" > /tmp/.fileinfo
+	MKINFO="$( cat /tmp/.fileinfo | eval ssh "${SSHOPTS}" -p ${PO} ${defremusr}@${IP} "if \[ ! -f \"$INFOFILEP\" \]\;then cat \> \"$INFOFILEP\"\;fi" )"
+        if [ "$?" -ne "0" ]
+        then
+            echo "XSITools error: failed to create .info file <$INFOFILEP>"
+            ERR XSITDT04 "XSITools error: failed to create .info file <$INFOFILEP>"
+        fi
+	rm -rf /tmp/.fileinfo
+	
+	MKREPO="$( echo "$MKREPO" | sed '/FIPS mode initialized/d' )"
+	MKINFO="$( echo "$MKINFO" | sed '/FIPS mode initialized/d' )"
+
+	#writeout "Generating hash map for <${FILENAME}>"
+	rm -rf /tmp/.${FILENAME}.hashmap 2>/dev/null && touch /tmp/.${FILENAME}.hashmap
+	#drawline
+
+        xrtr=0
+        retrybb=""
+        retrnum=0
+        START=$(date +%s)
+        icnt=1
+        ZCNT=0
+        NCNT=0
+        until [ $icnt -eq $(( ${BLOCKCNT}+1 )) ]
+        do
+	    echo -ne "$(( $icnt-1 ))/$BLOCKCNT blocks | Processed $(( $(( $icnt+1 ))*100/$BLOCKCNT ))%\033[0K\r"
+	    REGSUBBLKCNT=$SUBBLKCNT
+            FULSUBBLKCNT=$SUBBLKCNT
+            INXS="0"
+            if [ "$icnt" -eq "$(( $BLOCKCNT ))" ]
+            then
+                INXS=$( python -c "print ('0') if ($FILESIZE/float($SUBBLKSIZ))==(int($FILESIZE/$SUBBLKSIZ)) else ('1')" )
+                FULSUBBLKCNT=$(( ${FILESIZE}%${BLOCKSIZE}/${SUBBLKSIZ} ))
+                SUBBLKCNT=$(( ${FILESIZE}%${BLOCKSIZE}/${SUBBLKSIZ}+${INXS} ))
+                LASTBLOCKSIZE=$SUBBLKCNT
+            fi
+
+#S1=$(python -c "import time;print int(round(time.time() * 1000))")
+	    
+	    skip=$(( $(( ${icnt}-1 ))*${REGSUBBLKCNT} ))
+	    if [ ! -f "${DESCRIPT}.extents" ]
+	    then
+	    	BHD="1"
+	    else
+	    	if [ "${NOEXTMAP}" -eq "1" ]
+	    	then
+	    	    BHD="1"	
+	    	else
+	    	    BHD="$( blockHasData "${DESCRIPT}.extents" "$(( $SUBBLKSIZ * $skip ))" "$BLOCKSIZE" )"
+	    	fi
+	    fi
+	    if [ "${BHD}" -eq "1" ]
+	    then	    
+	    	HASH=$( ( "$DDBIN" if="$FILEPATH" bs=$SUBBLKSIZ count=$SUBBLKCNT skip=${skip} 2>/dev/null | \
+		"$OSBIN" sha1 2>/dev/null | grep -Eo "[0-9a-f]{40}" | sed -e 's/^ *//g' -e 's/ *$//g' ) 2>&1 )
+#E1=$(python -c "import time;print int(round(time.time() * 1000))")
+	    	echo "${HASH}" >> /tmp/.${FILENAME}.hashmap
+	    	# Does the block exist on the other end?
+            	FstL=${HASH:0:1}
+            	SndL=${HASH:1:1}
+            	TrdL=${HASH:2:1}
+	    	HASHDIR="$DTTARGET"/"$FstL"/"$SndL"/"$TrdL"
+
+#S2=$(python -c "import time;print int(round(time.time() * 1000))")
+	    	if [ "$HASH" != "$SHA1ZERO" ]
+	    	then
+	    	    #T1=$(python -c "import time;N=datetime.datetime.now();print (time.mktime(N.timetuple())*1e3 + N.microsecond/1e3)*1000")
+	    	    DBE=$( ( eval ssh "${SSHOPTS}" -p ${PO} ${defremusr}@${IP} "if [ ! -d \"$HASHDIR\" ]\;then mkdir -p \"$HASHDIR\"\;fi\;if [ -f \"${HASHDIR}/${HASH}\" ]\;then echo -n 1\;else echo -n 0\;fi" ) 2>&1 )
+	    	    EO=$?
+	    	    #T2=$(python -c "import time;N=datetime.datetime.now();print (time.mktime(N.timetuple())*1e3 + N.microsecond/1e3)*1000")
+	    	    DBE="$( echo "$DBE" | sed '/FIPS mode initialized/d' )"
+
+#echo "DBE: $DBE"
+#echo "EO: $EO"	    	    	
+            	    if [ "$compression" == "0" ]
+            	    then
+                    	if [ "${EO}" -eq "0" -a "${DBE}" -gt "-1" -a "${DBE}" -lt "2" ]
+                    	then
+                    	    if [ "${DBE}" -eq "0" ]
+                    	    then
+                    	    	CPB=$( ( "$DDBIN" if="$FILEPATH" bs=$SUBBLKSIZ count=$SUBBLKCNT skip=$skip 2>/dev/null | \
+		    	    	eval ssh "${SSHOPTS}" -p ${PO} ${defremusr}@${IP} "cat \> \"${HASHDIR}/${HASH}.tmp\" \&\& mv \"${HASHDIR}/${HASH}.tmp\" \"${HASHDIR}/${HASH}\" \&\& echo -n 1" ) 2>&1 )
+            	    	    	EE=$?
+            	    	    else
+            	    	    	CPB=0
+            	    	    	EE=0
+            	    	    fi
+            	    	else
+            	    	    EE="3"	
+            	    	fi    
+            	    else
+            	    	if [ "${EO}" -eq "0" -a "${DBE}" -gt "-1" -a "${DBE}" -lt "2" ]
+            	    	then
+            	    	    if [ "${DBE}" -eq "0" ]
+            	    	    then
+            	    	    	CPB=$( ( "$DDBIN" if="$FILEPATH" bs=$SUBBLKSIZ count=$SUBBLKCNT skip=$skip 2>/dev/null | "$LZBIN" -1 -c | \
+			    	eval ssh "${SSHOPTS}" -p ${PO} ${defremusr}@${IP} "cat \> \"${HASHDIR}/${HASH}.tmp\" \&\& mv \"${HASHDIR}/${HASH}.tmp\" \"${HASHDIR}/${HASH}\" \&\& echo -n 1" ) 2>&1 )
+            	    	    	EE=$?
+            	    	    else
+            	    	    	CPB=0
+            	    	    	EE=0
+            	    	    fi	
+            	    	else
+            	    	    EE="3"	
+            	    	fi
+            	    fi
+            	    CPB="$( echo "${CPB}" | sed '/FIPS mode initialized/d' )"
+#echo "EE: $EE"
+#echo "CPB: $CPB"
+            	    if [ "${EE}" -ne "0" ] || [ "$CPB" != "0" -a "$CPB" != "1" ]
+            	    then
+            	    	echo "Error: ${DBE}, exit status: ${EE}"
+            	    	drawline
+            	    	icnt=$(( $icnt-1 ))
+            	    	sed -i '$ d' /tmp/.${FILENAME}.hashmap
+            	    	echo "Retrying block ${icnt}"
+			drawline
+			retrnum=$(( $retrnum+1 ))
+			ERR XSITRM01 "Error ${retrnum} processing block number $(( $icnt+1 ))" W            	    	
+            	    	if [ ${retrnum} -gt "10" ]
+            	    	then
+            	    	    ERR XSITRM02 "Error processing block of data, errno: {$EE}, desc:  ${DBE}"
+            	    	    ERR XSITRM03 "Connection is too unstable ${retrnum} retries so far, giving up."
+            	    	    exit ${EE}
+            	    	fi    
+            	    fi
+            	    if [ "$CPB" == "1" ]
+            	    then 
+	    	    	NCNT=$(( ${NCNT}+1 ))
+	    	    fi
+	    	fi
+#E2=$(python -c "import time;print int(round(time.time() * 1000))")	
+#T2=$(python -c "print int(${E2}-${S2})")
+	    else
+#E1=$(python -c "import time;print int(round(time.time() * 1000))")
+		echo "${SHA1ZERO}" >> /tmp/.${FILENAME}.hashmap
+#ZC="MAP"
+#HASH="0000000000000000000000000000000000000000"         
+            	DBE="Z"
+	    fi
+            
+#echo -e "${icnt}:::${HASH}:::${DBE}:::${ZC}:::$(python -c "print int(${E1}-${S1})"):::$(python -c "print int(${E2}-${S2})")\033[0K\r"
+	    	
+	icnt=$(( $icnt+1 ))
+	done
+
+	CPMAP="$( ( cat "/tmp/.${FILENAME}.hashmap" | eval ssh "${SSHOPTS}" -p ${PO} ${defremusr}@${IP} "cat \> \"$HASHTABLE\"" ) 2>&1 )"
+        CPMAP="$( echo "$CPMAP" | sed '/FIPS mode initialized/d' )"
+        if [ "$?" -ne "0" -o "${CPMAP}" != "" ]
+        then
+            echo "XSITools error: failed to create hash table file <$HASHTABLE>"
+            ERR XSITDT05 "XSITools error: failed to create hash table file <$HASHTABLE>"
+        else
+            echo "Hashtable <$HASHTABLE> was copied successfully"
+            drawline	
+        fi
+	
+        END=$(date +%s)
+        TIMEDIFF=$(( $END - $START + 1 ))
+	echo -en "\033[2K"
+	echo "Time taken: $TIMEDIFF seconds"
+        SPEED=$( python -c "print(int($FILESIZE/1048576/$TIMEDIFF))" )
+        echo "Avg speed: $SPEED mb/s"
+	PREVIOCNT="$( eval ssh "${SSHOPTS}" -p ${PO} ${defremusr}@${IP} "cat \\\"$RTTARGET/.xsitools\\\" | grep 'Bcnt:' | awk -F ': ' '{print \$2}'" )"
+	NEWBCOUNT="$(( ${NCNT}+${PREVIOCNT} ))"
+        echo "Previous block count: ${PREVIOCNT}"
+        echo "Current block count: ${NEWBCOUNT}"
+	UPDATECNT="$( ( eval ssh "${SSHOPTS}" -p ${PO} ${defremusr}@${IP} "sed -i \\\"/Bcnt/c\\\Bcnt: $NEWBCOUNT\\\" \\\"$RTTARGET/.xsitools\\\"" ) 2>&1 )"
+	#eval ssh -v "${SSHOPTS}" -p ${PO} ${defremusr}@${IP} "sed -i \\\"/Bcnt/c\Bcnt: $NEWBCOUNT\\\" \\\"$RTTARGET/.xsitools\\\"" 2>&1
+	UPDATECNT="$( echo "$UPDATECNT" | sed '/FIPS mode initialized/d' )"
+	if [ "$?" -ne "0" -o "${CPMAP}" != "" ]
+	then
+	    echo "XSITools error: failed to update the block count"
+	    ERR XSITDT06 "XSITools error: failed to update the block count"	
+	fi
+	echo "$(( ${icnt}-1 )) blocks, ${NCNT} ($(( ${NCNT}*${BLOCKSIZE}/${SUBBLKSIZ} )) mb) are new"	
+	drawline
+	
+    else
+
+	PA="$3"
+	RTTARGET=$( dirname $( dirname "$PA" ) )
+	DTTARGET="$RTTARGET"/data
+	HASHTABLE="$PA"/"$FILENAME"
+	INFOFILEP="$HASHTABLE.info"
+
+	if [ ! -d "$RTTARGET" ]
+	then
+	    mkdir -p "$RTTARGET"
+	fi
+
+        if [ ! -d "$DTTARGET" ]
+        then
+            mkdir -p "$DTTARGET"
+            echo "Desc: XSITools Repo v 1.0.0" > "$RTTARGET"/.xsitools
+            echo "Bsiz: $BLOCKSIZE" >> "$RTTARGET"/.xsitools
+            echo "Bcnt: 0" >> "$RTTARGET"/.xsitools
+            echo "Comp: $compression" >> "$RTTARGET"/.xsitools
+        fi
+
+	if [ ! -d "$PA" ]
+        then
+            mkdir -p "$PA"
+        fi
+
+        if [ -f "$RTTARGET"/.xsitools ]
+        then
+            REPOBSIZE=$( cat "$RTTARGET"/.xsitools | grep Bsiz | awk -F ': ' '{print $2}' )
+            if [ "$REPOBSIZE" -ne "$BLOCKSIZE" ]
+            then
+            	writeout "XSITools Error: you cannot backup to this repository with a blocksize of $BLOCKSIZE"
+            	writeout "The block size has been set to $REPOBSIZE upon repository creation"
+            	drawline
+            	exit 33
+            fi
+        else
+            writeout "Can't find the .xsitools file in the root of the repo"
+            writeout "Your repository ${backuppoint} is broken, fix it by renaming "
+            writeout "the folder and allowing XSIBackup to create it again"
+            drawline	
+        fi
+
+        REPOCOMP=$( cat "$RTTARGET"/.xsitools | grep Comp | awk -F ': ' '{print $2}' )
+
+        if [ "$REPOCOMP" -ne "$compression" ]
+        then
+            if [ "$compression" == "0" ]
+            then
+                writeout "XSITools Error: this is a compressed repository, you must enable compression to backup to it"
+                drawline
+            else
+                writeout "XSITools Error: this is an uncompressed repository, you cannot backup to it with compression enabled"
+                drawline
+            fi
+            exit 33
+        fi
+
+        echo -n "" > "$HASHTABLE" && touch "$HASHTABLE"
+        echo -n "" > "$INFOFILEP" && touch "$INFOFILEP"
+
+	echo "Backing up via XSITools"
+	drawline
+	echo "File name: $FILENAME, File size: $FILESIZE"
+	echo "Block size: $BLOCKSIZE, Block count: $BLOCKCNT"
+	echo "Disk usage: $DISKUSAG"
+	drawline
+
+	echo "fsize: $FILESIZE" > "$INFOFILEP"
+	echo "usage: $DISKUSAG" >> "$INFOFILEP"
+	echo "bsize: $BLOCKSIZE" >> "$INFOFILEP"
+	echo "bcomp: $compression" >> "$INFOFILEP"
+
+	xrtr=0
+	retrybb=""	
+	START=$(date +%s)
+	icnt=1
+	ZCNT=0
+	NCNT=0
+	until [ $icnt -eq $(( ${BLOCKCNT}+1 )) ]
+	do
+	    #NOW=$(date +%s)
+	    #LPS=$(( $NOW - $START ))
+	    #POS=$( python -c "print($icnt*$BLOCKSIZE)" )
+	    #SPD=$( python -c "print($POS/1048576/($LPS+1))" )
+	    #echo -ne "Processed $(( $icnt*100/$BLOCKCNT ))% | $SPD Mb/s\033[0K\r"	
+	    echo -ne "$(( $icnt ))/$BLOCKCNT blocks | Processed $(( $(( $icnt+1 ))*100/$BLOCKCNT ))%\033[0K\r"	
+	    REGSUBBLKCNT=$SUBBLKCNT
+	    FULSUBBLKCNT=$SUBBLKCNT
+	    INXS="0"
+	    if [ "$icnt" -eq "$(( $BLOCKCNT ))" ]
+	    then
+	    	INXS=$( python -c "print ('0') if ($FILESIZE/float($SUBBLKSIZ))==(int($FILESIZE/$SUBBLKSIZ)) else ('1')" )
+	    	FULSUBBLKCNT=$(( ${FILESIZE}%${BLOCKSIZE}/${SUBBLKSIZ} ))
+	    	SUBBLKCNT=$(( ${FILESIZE}%${BLOCKSIZE}/${SUBBLKSIZ}+${INXS} ))
+	        LASTBLOCKSIZE=$SUBBLKCNT
+	    fi
+	    skip=$(( $(( ${icnt}-1 ))*${REGSUBBLKCNT} ))
+            if [ ! -f "${DESCRIPT}.extents" ]
+            then
+                BHD="1"
+            else
+                if [ "${NOEXTMAP}" -eq "1" ]
+                then
+                    BHD="1"
+                else
+                    BHD="$( blockHasData "${DESCRIPT}.extents" "$(( $SUBBLKSIZ * $skip ))" "$BLOCKSIZE" )"
+                    if [ "${BHD}" != "1" -a "${BHD}" != "0" ]
+		    then
+			writeout "Error: function blockHasData returned: $BHD"
+			ERR XSITBHD1 "Error: function blockHasData returned: $BHD"	
+		    fi	
+		fi
+            fi
+	    if [ "${BHD}" -eq "1" ]
+	    then
+		HASH=$( ( "$DDBIN" if="$FILEPATH" bs=$SUBBLKSIZ count=$SUBBLKCNT skip=${skip} 2>/dev/null | "$OSBIN" sha1 2>/dev/null | grep -Eo "[0-9a-f]{40}" | sed -e 's/^ *//g' -e 's/ *$//g' ) 2>&1 )
+		if [ "${#HASH}" -ne "40" ]
+		then
+		    ERR XSITBPHS "Cannot process block $icnt, error getting hash, will retry. Warning: $HASH" W
+		    writeout "\033[1;31mCannot process block $icnt, error getting hash, will retry. Warning: $HASH\033[0m"
+		    writeout "Retrying..."
+		    icnt=$(( $icnt-1 ))
+		    sleep 1
+		else
+		    echo "$HASH" >> "$HASHTABLE" 
+		    if [ "$HASH" != "$SHA1ZERO" -o "$ZCNT" -eq "0" ]
+		    then
+			FstL=${HASH:0:1}
+			SndL=${HASH:1:1}
+			TrdL=${HASH:2:1}
+			HASHDIR="$DTTARGET"/"$FstL"/"$SndL"/"$TrdL"
+			EXISTS=$( ls "$HASHDIR"/"$HASH" 2>/dev/null | wc -l )
+			if [ $EXISTS -eq 0 ]
+			then			
+			    if [ ! -d "$HASHDIR" ]
+			    then
+			    	mkdir -p "$HASHDIR"
+			    fi
+			    if [ "$compression" == "0" ]
+			    then
+			    	DDOUT=$( ( "$DDBIN" if="$FILEPATH" bs=$SUBBLKSIZ count=$SUBBLKCNT skip=${skip} of="$HASHDIR/${HASH}.tmp" && mv "$HASHDIR/${HASH}.tmp" "$HASHDIR/${HASH}" ) 2>&1 )
+			    else
+			    	DDOUT=$( ( "$DDBIN" if="$FILEPATH" bs=$SUBBLKSIZ count=$SUBBLKCNT skip=${skip} | "$LZBIN" -1 -c | cat > "$HASHDIR/${HASH}.tmp" && mv "$HASHDIR/${HASH}.tmp" "$HASHDIR/${HASH}" ) 2>&1 )
+			    fi
+			    if [ "${DDOUT:0:32}" != "${FULSUBBLKCNT}+${INXS} records in${newline}${FULSUBBLKCNT}+${INXS} records out" -a "${DDOUT:0:30}" != "${FULSUBBLKCNT}+${INXS} records in${newline}${FULSUBBLKCNT}+${INXS} records out" ]
+			    then
+			        if [ "$xrtr" -lt "10" ]
+			        then
+			            ERR XSITBPWC "Cannot process block $HASH ($icnt), this is just a warning, will try again. Warning: ${DDOUT:0:32}" W
+			            writeout "\033[1;31mCannot process block $HASH ($icnt), error: ${DDOUT:0:32}\033[0m"
+			            xrtr=$(( $xrtr+1 ))
+			            writeout "Retrying block $icnt for the $xrtr time"
+			            icnt=$(( $icnt-1 ))
+			            rm -f "$HASHDIR/$HASH" 2>/dev/null
+			            sed -i '$ d' "$HASHTABLE" 2>/dev/null
+			            sleep 1
+			        else
+			            retrybb=${retrybb};"$(( $icnt-1 ))"
+			            echo "$(( $icnt-1 ))|0000000000000000000000000000000000000000" >> "$HASHTABLE"
+			        fi
+			    else
+			        NCNT=$(( $NCNT+1 ))
+			    fi
+			fi
+		    fi
+		    if [ "$ZCNT" -eq "0" -a "$HASH" == "$SHA1ZERO" ]
+		    then
+		    	ZCNT=1
+		    fi
+		    if [ "$?" -ne "0" ]
+		    then
+		    	exit 33
+		    fi
+	    	fi
+	    else	
+    		echo "$SHA1ZERO" >> "$HASHTABLE"
+	    fi	
+	icnt=$(( $icnt+1 ))
+	done
+	# Just for testing purposes >>>
+	# if [ -f "$PWD"/retry.txt ]
+	# then
+	#    retrybb="$( cat "$PWD"/retry.txt )"
+	# fi
+	# Just for testing purposes <<<
+	REGSUBBLKCNT=$SUBBLKCNT
+	SUBBLKCNT=$(( $BLOCKSIZE/$SUBBLKSIZ ))
+	if [ "$retrybb" != "" ]
+	then
+	    sync
+	    sleep 2
+	    writeout "Last resort retry for blocks: $retrybb"
+	    ERR XSITLRRB "Last resort retry for blocks: $retrybb" W
+	    drawline
+	    IFS=";"
+	    for rbb in $retrybb
+	    do	
+	        if [ "$(( $rbb+1 ))" -eq "$BLOCKCNT" ]
+	        then
+		    echo "You won the lottery!, your last block has been set for retry"
+		    SUBBLKCNT=$LASTBLOCKSIZE	    		       	    	 
+	        fi
+	        HASH=$( "$DDBIN" if="$FILEPATH" bs=$SUBBLKSIZ count=$SUBBLKCNT skip=$(( ${rbb}*${REGSUBBLKCNT} )) conv=notrunc,sync 2>/dev/null | "$OSBIN" sha1 2>/dev/null | grep -Eo "[0-9a-f]{40}" | sed -e 's/^ *//g' -e 's/ *$//g' )
+		if [ "${#HASH}" -ne "40" ]
+		then
+		    ERR XSITHBAD "Bad irrecoverable block at position $rbb. Error: $HASH: $HASH"
+		    writeout "\033[1;31mBad irrecoverable block at position $rbb. Error: $HASH\033[0m"
+		else                                                                                            
+		    FstL=${HASH:0:1}
+		    SndL=${HASH:1:1}
+		    TrdL=${HASH:2:1}
+		    HASHDIR="$DTTARGET"/"$FstL"/"$SndL"/"$TrdL"
+                    if [ ! -d "$HASHDIR" ]
+                    then
+                    	mkdir -p "$HASHDIR"
+                    fi
+		    if [ "$compression" == "0" ]
+		    then
+		        DDOUT=$( ( "$DDBIN" if="$FILEPATH" bs=$SUBBLKSIZ count=$SUBBLKCNT conv=notrunc,sync skip=$(( ${rbb}*${REGSUBBLKCNT} )) of="$HASHDIR/$HASH" ) 2>&1 )
+		    else
+			DDOUT=$( ( "$DDBIN" if="$FILEPATH" bs=$SUBBLKSIZ count=$SUBBLKCNT conv=notrunc,sync skip=$(( ${rbb}*${REGSUBBLKCNT} )) | "$LZBIN" -1 -c | cat > "$HASHDIR/$HASH" ) 2>&1 )
+		    fi
+		    if [ "${DDOUT:0:32}" != "${SUBBLKCNT}+0 records in${newline}${SUBBLKCNT}+0 records out" -a "${DDOUT:0:30}" != "${SUBBLKCNT}+0 records in${newline}${SUBBLKCNT}+0 records out" ]
+		    then
+			ERR XSITLRRB "I give up!, I can't backup $BLOCKSIZE block at pos $rbb in file $FILEPATH. Fatal error: $DDOUT"
+		    else
+		        writeout "\033[1;34mRecovered block $rbb with hash: $HASH\033[0m"
+		        SOO="$( sed -i "s/$rbb|0000000000000000000000000000000000000000/$HASH/" "$HASHTABLE" )"
+			if [ "$SOO" != "" ]
+			then
+			    writeout "\033[1;31mError trying to correct entry number <$rbb> for hash <$HASH>\033[0m"
+			    ERR XSITHBAD "Error trying to correct entry number <$rbb> for hash <$HASH>"	
+			fi	
+		    fi	    
+		fi
+	    done
+	    IFS=$OLDIFS
+	    drawline
+	else
+	    echo ""
+	fi
+	# Clear line
+	#echo -e "\033[3J"	
+	OLDBCNT=$( cat "$RTTARGET"/.xsitools | grep "Bcnt:" | awk -F ': ' '{print $2}' )
+	NEWBCNT=$(( $OLDBCNT+$NCNT ))
+	echo -e "Previous block count: $OLDBCNT"
+	echo "Current block count: $NEWBCNT"
+	drawline
+	if [ "$OLDBCNT" -ne "$NEWBCNT" ]
+	then
+	    sed -i "/Bcnt/c\Bcnt: $NEWBCNT" "$RTTARGET"/.xsitools
+	fi
+	END=$(date +%s)
+	TIMEDIFF=$(( $END - $START + 1 ))
+        #echo "BLOCKCNT: $BLOCKCNT"
+        echo "Time taken: $TIMEDIFF seconds"
+        SPEED=$( python -c "print(int($FILESIZE/1048576/$TIMEDIFF))" )
+        echo "Avg speed: $SPEED mb/s"
+
+    fi
+
+elif [ "$1" == "prune" ]
+then
+    indchar="\e[90m-\033[0m"
+    WD="/tmp/"
+    WD="${WD%/}"/	
+
+    if [ "${prunexsitoolsrepo}" != "" ]
+    then
+	writeout "PRUNING (c)XSITOOLS REPOSITORY"
+	drawline
+    fi
+    if [ ! -d "$2" ]
+    then
+    	echo "The path <$2> is not a directory"
+    	exit 33
+    fi
+    if [ ! -f "$( dirname "$2" )/.xsitools" ]
+    then		
+	echo "The path <$2> does not seem to be inside an XSITools repository"
+	exit 33
+    fi
+    if [ "${testmode}" != "true" -a "${testmode}" != "yes" ]
+    then
+    	echo -e "${indchar}${indchar} Pruning exclusive blocks of backup <${2}>"
+    else
+    	echo -e "${indchar}${indchar} Test Pruning (c)XSITools repository"
+    	echo -e "${indchar}${indchar} No data will be erased"
+    fi
+    XSITRepo="$( dirname "$2" )"
+
+    # Delete any eventual previous info
+    rm -rf "${WD}".0 2>/dev/null	
+    rm -rf "${WD}".1 2>/dev/null
+    rm -rf "${WD}".xsifd* >/dev/null
+
+NOB="$( ls -la "${XSITRepo%/}"/ | grep -Eo "[0-9]{14}" | wc -l )"
+if [ "${NOB}" -gt "1" ]
+then
+    
+    # Get hashes to delete
+    # find "${XSITRepo%/}"/ -maxdepth 3 -path "${XSITRepo%/}"/data -prune -o -path "${2}" -prune -o -type f -name *-flat.vmdk -print -exec cat "{}" \; \
+    # | sort -u > "${WD}".0;find "${XSITRepo%/}"/ -maxdepth 3 -path "${XSITRepo%/}"/data -prune -o -type f -name *-flat.vmdk -print -exec cat "{}" \; \
+    # | sort -u > "${WD}".1
+
+    # Get hashes to delete
+    find "${XSITRepo%/}"/ -maxdepth 3 -path "${XSITRepo%/}"/data -prune -o -path "${2}" -prune -o -type f -name *-flat.vmdk -print0 | xargs -0 cat \
+    | sort -u > "${WD}".0;find "${XSITRepo%/}"/ -maxdepth 3 -path "${XSITRepo%/}"/data -prune -o -type f -name *-flat.vmdk -print0 | xargs -0 cat \
+    | sort -u > "${WD}".1
+
+    if [ "$( sizeOf "${WD}.0" )" -eq "0" ]
+    then
+    	echo -e "${indchar}${indchar} Nothing to prune: there's probably just one backup in the repo"
+    	exit 1
+    else
+    	NuDELETE="$( diff -u "${WD}".1 "${WD}".0 | grep \^\- | grep -Eo "[0-9a-f]{40}" | wc -l )"
+    	ToDELETE="$( diff -u "${WD}".1 "${WD}".0 | grep \^\- | grep -Eo "[0-9a-f]{40}" )"
+    fi
+    ps="0"
+    if [ "$ToDELETE" != "" ]
+    then	
+    	pn="1"
+    	SZ="0"
+    	for h in $ToDELETE
+    	do
+	    FstL=${h:0:1}
+	    SndL=${h:1:1}
+	    TrdL=${h:2:1}
+	    HF="${XSITRepo%/}/data/${FstL}/${SndL}/${TrdL}/${h}"
+	    SZ="$( ls -1las "${HF}" 2>/dev/null | awk '{print $4}' )"
+	    if [ "$SZ" == "" ]
+	    then
+	    	SZ="0"
+	    fi
+	    ps=$( python -c "print(int(${ps}+${SZ}))" )
+	    if [ "${testmode}" != "true" -a "${testmode}" != "yes" ]
+	    then
+	    	if [ -f "${HF}" ]
+	    	then
+	    	    rm -rf "${HF}"
+	    	fi
+	    fi
+	    echo -ne "${indchar}${indchar} $(( ${pn} ))/${NuDELETE} blocks | freed $(( ${ps}/1024/1024 )) Mb | Processed $(( $(( ${pn} ))*100/${NuDELETE} ))%\033[0K\r"
+    	    pn=$(( ${pn}+1 ))
+    	done
+    	echo ""
+    	DS="$( du -sm "${2}" | awk '{print $1}' )"
+    	DS=$(( ${DS}/1024 ))
+    	if [ "${testmode}" != "true" -a "${testmode}" != "yes" ]
+    	then
+    	    echo -e "${indchar}${indchar} Deleting <${2}> directory (${DS} Mb)"
+    	    rm -rf "${2}" 2>/dev/null
+    	    xsitbc="$( cat "${XSITRepo%/}"/.xsitools | grep "Bcnt:" | awk -F ': ' '{print $2}' )"
+    	    sed -i "/Bcnt:/c\Bcnt: $(( ${xsitbc}-${NuDELETE} ))" "${XSITRepo%/}"/.xsitools
+    	    echo -e "${indchar}${indchar} Blocks deleted: ${NuDELETE}"
+    	    echo -e "${indchar}${indchar} Space saved: $(( ${ps}/1024/1024 )) Mb"
+    	else
+    	    echo -e "${indchar}${indchar} You could delete ${NuDELETE} blocks"
+    	    echo -e "${indchar}${indchar} You can free: $(( ${ps}/1024/1024 )) Mb"
+    	fi
+    else
+    	DS="$( du -sm "${2}" | awk '{print $1}' )"
+    	echo -e "${indchar}${indchar} No blocks exclusive to <${2}> can be deleted" && rm -rf "${2}" 2>/dev/null
+    	echo -e "${indchar}${indchar} Less than $(( ${DS}+1 )) Mb. were freed from descriptors and snapshots"
+    fi
+    echo "prune_saved=${ps}" > /tmp/.xsifd1
+
+else
+	writeout "${indchar}${indchar} Nothing to prune"
+	echo "NOTHING TO PRUNE" > /tmp/.xsifd1
+fi
+
+elif [ "$1" == "copy" ]
+then
+	if [ ! -f "$2" ]
+        then
+            echo "File $2 does not exist"
+            exit 33
+        else
+            FILEPATH="$2"
+            FILENAME=$( basename "$2" )
+            FILESIZE=$( sizeOf "$FILEPATH" )
+            DISKUSAG=$( du "$FILEPATH" | awk '{print $1}' )
+            DISKUSAG=$( python -c "print(int($DISKUSAG*1024))" )
+            BLKSUSED=$( python -c "print(int($DISKUSAG/$BLOCKSIZE))" )
+            PERCTFILL=$( python -c "print(int($DISKUSAG*100/$FILESIZE))" )
+
+            BLOCKCNT1=$( python -c "print(int($FILESIZE/$BLOCKSIZE))" )
+            BLOCKCNT2=$( python -c "print($FILESIZE/float($BLOCKSIZE))" )
+            COMPBOOLE=$( python -c "print($BLOCKCNT1 == $BLOCKCNT2)" )
+            COMPBOOLE=$( echo "$COMPBOOLE" | awk '{print tolower($0)}' )
+            if [ "$COMPBOOLE" == "true" ]
+            then
+                BLOCKCNT=$BLOCKCNT1
+            else
+                BLOCKCNT=$(( $BLOCKCNT1+1 ))
+            fi
+        fi
+
+	network_copy=0
+	local_hmap_exists=0
+	if [ "$( echo "$3" | grep -oE "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])[:][0-9]{1,5}:/.*/.*" | wc -l )" -eq "1" ]
+	then
+	    network_copy=1
+	    local_hmap_path="/tmp/${FILENAME}.hmap"
+	    xcNETIPv4=$( echo "$3" | awk -F ':' '{print $1}' )
+	    xcNETPort=$( echo "$3" | awk -F ':' '{print $2}' )
+	    xcNETPath=$( echo "$3" | awk -F ':' '{print $3}' )
+	    REMOTEHMAPEXISTS=$( eval ssh "$SSHOPTS" -p$xcNETPort ${defremusr}@$xcNETIPv4 "[ -f \"$xcNETPath/${FILENAME}.hmap\" ] && echo 1 || echo 0" )
+	    [ -f "${local_hmap_path}" ] && rm -rf "${local_hmap_path}" || echo "No "${local_hmap_path}" found"
+	    if [ "$REMOTEHMAPEXISTS" -eq "1" ]
+	    then
+	    	ssh "$SSHOPTS" -p$xcNETPort ${defremusr}@$xcNETIPv4 "cat \"$xcNETPath/${FILENAME}.hmap\" && rm -rf \"$xcNETPath/${FILENAME}.hmap\"" | cat > "${local_hmap_path}"
+	    	ssh "$SSHOPTS" -p$xcNETPort ${defremusr}@$xcNETIPv4 "rm -rf \"$xcNETPath/${FILENAME}.hmap\" && echo \"$xcNETPath/${FILENAME}.hmap deleted\" || echo \"Could not delete xcNETPath/${FILENAME}.hmap\""	
+	    	if [ -f "${local_hmap_path}" ]
+	    	then
+	    	    local_hmap_exists=1
+		    LOCALMAPTABLE=$( cat "${local_hmap_path}" )
+	    	    COUNTHMAP=$( echo "$LOCALMAPTABLE" | wc -l )
+	    	    if [ "$COUNTHMAP" -ne "$BLOCKCNT" ]
+	    	    then
+	    	    	echo "The number of mapped blocks at ${local_hmap_path} does not match current block number: $BLOCKCNT..., reinitializing copy"
+	    	    	rm -rf "${local_hmap_path}"
+	    	    	local_hmap_exists=0
+			LOCALMAPTABLE=""	
+	    	    else
+	    	    	echo "$COUNTHMAP blocks in ${local_hmap_path} | OK"
+	    	    fi
+	    	fi
+	    fi	
+	fi
+        echo "Copying with XSITools..."
+        drawline
+        echo "File name: $FILENAME, File size: $FILESIZE"
+        echo "Block size: $BLOCKSIZE, Block count: $BLOCKCNT"
+        echo "Disk usage: $DISKUSAG, Blocks used: $BLKSUSED, Filled: ${PERCTFILL}%"
+        if [ ! -d "$3" ]
+        then
+            mkdir -p "$3"
+        fi
+	TARGETFILE="$3"/"$FILENAME"
+        if [ "$network_copy" -eq "0" ]
+        then
+            # 1M block count
+            COUNT=$( python -c "print(int($FILESIZE/1048576))" )
+            echo "Creating file..."
+            "$DDBIN" of="$TARGETFILE" bs=1048576 seek=$COUNT count=0
+	fi
+        START=$(date +%s)
+        icpy=0
+        until [ $icpy -eq $(( $BLOCKCNT )) ]
+        do
+	    "$PWD"/xsidiff --source="$FILEPATH" --target=stdout --skip-blocks=$icpy --block-number=1 --block-size=$BLOCKSIZE --raw-data > /tmp/B
+	    HASH=$( cat /tmp/B | "$OSBIN" sha1 2>/dev/null | grep -Eo "[0-9a-f]{40}" | sed -e 's/^ *//g' -e 's/ *$//g' )
+	    #HASH=$( "$DDBIN" if="$FILEPATH" bs=$BLOCKSIZE count=1 skip=$icpy 2>/dev/null | "$OSBIN" sha1 2>/dev/null | grep -Eo "[0-9a-f]{40}" | sed -e 's/^ *//g' -e 's/ *$//g' )
+	    STORED_HASH=""
+	    if [ "$local_hmap_exists" -eq "1" ]
+	    then
+	    	STORED_HASH=$( sed "$(( $icpy+1 ))q;d" "${local_hmap_path}" | sed -e 's/^ *//g' -e 's/ *$//g' )
+            fi
+	    echo -ne "$(( $icpy+1 ))/$BLOCKCNT | Processed $(( $(( $icpy+1 ))*100/$BLOCKCNT ))%\033[0K\r"
+	    if [ "$network_copy" -eq "0" ]
+	    then
+	    	if [ "$icpy" -gt "$BLKSUSED" ]
+	    	then 
+	    	    if [ "$HASH" != "$SHA1ZERO" ]
+	    	    then			    
+            	    	"$DDBIN" if="$FILEPATH" of="$TARGETFILE" bs=$BLOCKSIZE count=1 skip=$icpy seek=$icpy 2>/dev/null
+            	    	#"$DDBIN" if="$FILEPATH" bs=$BLOCKSIZE count=1 skip=$icpy 2>/dev/null | cat > "$DDBIN" of="$TARGETFILE" bs=$BLOCKSIZE seek=$icpy 2>/dev/null
+	    	    fi
+	    	else
+            	    "$DDBIN" if="$FILEPATH" of="$TARGETFILE" bs=$BLOCKSIZE count=1 skip=$icpy seek=$icpy 2>/dev/null
+	    	fi
+	    else
+	        if [ "$HASH" != "$SHA1ZERO" ]
+	        then
+	            #dd if="$FILEPATH" bs=$BLOCKSIZE count=1 skip=$icpy conv=notrunc 2>/dev/null | ssh $( echo "$RSSSHOPTS" "$SSHOPTS" ) -p"$xcNETPort" ${defremusr}@"$xcNETIPv4" "cat >> \"$xcNETPath/$FILENAME\" && echo $HASH >> \"$xcNETPath/${FILENAME}.hmap\""
+	            SRVPID=$( ssh $( echo "$RSSSHOPTS" "$SSHOPTS" ) -p"$xcNETPort" ${defremusr}@"$xcNETIPv4" "nohup \"$xsidefaultpath/bin/xsidiff\" $xcNETIPv4:33 \"$xcNETPath/$FILENAME\"" ) && \
+	            "$PWD"/bin/xsidiff "$FILEPATH" $xcNETIPv4:33 $(( $icpy*16384 )) $(( $BLOCKSIZE/16384 ))
+	            echo "REMOTE SRV PID: $SRVPID"
+	            #ssh $( echo "$RSSSHOPTS" "$SSHOPTS" ) -p"$xcNETPort" ${defremusr}@"$xcNETIPv4" "kill -9 $SRVPID"
+	    	else
+	            ssh -f $( echo "$SSHOPTS" ) -p"$xcNETPort" ${defremusr}@"$xcNETIPv4" "dd if=/dev/zero of=\"$xcNETPath/$FILENAME\" bs=$BLOCKSIZE count=1 seek=$icpy 2>/dev/null && echo $HASH >> \"$xcNETPath/${FILENAME}.hmap\""
+	    	fi
+	    fi
+	icpy=$(( $icpy+1 ))
+        done
+	echo ""
+        END=$(date +%s)
+        TIMEDIFF=$(( $END - $START + 1 ))
+        #echo "BLOCKCNT: $BLOCKCNT"
+        echo "Time taken: $TIMEDIFF"
+        SPEED=$( python -c "print($FILESIZE/1048576/$TIMEDIFF)" )
+        echo "Avg speed: $SPEED mb/s"
+
+elif [ "$1" == "restore" ]
+then
+
+    FILEPATH="$2"
+
+    if [ "$( isRemotePath "$4" )" -eq "1" ]
+    then
+	RT="remote"
+	FNAPP=".hashmap"
+	IP="$( echo "${4}" | awk -F ':' '{print $1}' )"
+	PO="$( echo "${4}" | awk -F ':' '{print $2}' )"
+	PA="$( echo "${4}" | awk -F ':' '{print $3}' )"
+	PA="${PA%/}/vmx_file_mimick"
+    else
+	RT="local"
+	if [ ! -f "${FILEPATH}" ]
+	then
+	    echo "$FILEPATH does not exist"
+	    exit 0
+	fi
+	PA="${2}"
+    fi
+
+    if [ "${RT}" == "remote" ]
+    then
+    	writeout "Looking for Rsync binary at remote host..."
+	drawline
+	REMOTEOS=$( eval ssh "$SSHOPTS" -p "$PO" ${defremusr}@"$IP" "\"uname | awk '{print \\\$1}' | awk '{print tolower(\\\$0)}' \"" 2>/dev/null )
+	if [ "$REMOTEOS" == "vmkernel" ]
+	then
+   	    writeout "Remote OS is ESXi"
+	    drawline
+	    RMRSYNCPATH="$( ( eval ssh "$SSHOPTS" -p ${PO} ${defremusr}@${IP} "ls -1 $xsidefaultpath/bin/xsibackup-rsync 2>/dev/null" ) 2>&1 )"
+	    RMRSYNCPATH="$( echo "$RMRSYNCPATH" | sed '/FIPS mode initialized/d' )" 
+    	else
+	    OSDESC="$( echo "$REMOTEOS" | awk '{print toupper($0)}' )"
+	    writeout "Remote OS is $OSDESC"
+	    drawline
+	    RMRSYNCPATH="$( ( eval ssh "$SSHOPTS" -p ${PO} ${defremusr}@${IP} "P\=\\\"\$\(which rsync\)\\\"\;if [ -f \\\"\\\$P\\\" ]\;then echo \\\$P\;fi" ) 2>&1 )"
+	    RMRSYNCPATH="$( echo "$RMRSYNCPATH" | sed '/FIPS mode initialized/d' )"
+	fi
+
+        if [ "${RMRSYNCPATH}" != "" ]
+	then
+	    writeout "Found Rsync binary at $RMRSYNCPATH"
+	    drawline
+	else
+	    rmrsyncp=""
+	    while [ "${rmrsyncp}" == "" ]
+	    do
+		read -p "I could not find remote Rsync binary, please enter path here: " rmrsyncp
+		RMRSYNCPATH="$( ( eval ssh "$SSHOPTS" -p ${PO} ${defremusr}@${IP} "ls -1 \"$rmrsyncp\" 2>/dev/null" ) 2>&1 )"
+		RMRSYNCPATH="$( echo "$RMRSYNCPATH" | sed '/FIPS mode initialized/d' )"
+	    done
+	    RMRSYNCPATH="${rmrsyncp}"		    
+	fi
+    fi
+
+    FILENAME=$( basename "$FILEPATH" )
+    FILESIZE=$( cat "$FILEPATH".info | grep fsize | awk -F ': ' '{print $2}' )
+    DISKUSAG=$( cat "$FILEPATH".info | grep usage | awk -F ': ' '{print $2}' )
+    BLOCKSIZE=$( cat "$FILEPATH".info | grep bsize | awk -F ': ' '{print $2}' )
+    SHA1ZERO=$( getSha1Zero "$BLOCKSIZE" )
+    BLOCKCOMP=$( cat "$FILEPATH".info | grep bcomp | awk -F ': ' '{print $2}' )
+	
+    RTTARGET="$( dirname "$( dirname "$( dirname "${PA}" )" )" )"
+    DTTARGET="$RTTARGET"/data
+    RETARGET=$( dirname "$3" )
+    ISPARTIAL=0
+    PARTIAL=0
+    if [ -f "$3".partial ]
+    then
+	PARTIAL="$( cat "$3".partial 2>/dev/null )"
+    else
+	echo "Cannot use .partial file to resume restore, a full restore will be performed instead"
+	PARTIAL=0	
+    fi
+
+    BLOCKCNT=$( cat "${FILEPATH}${FNAPP}" | wc -l )
+    NONZEROB=$( cat "${FILEPATH}${FNAPP}" | grep -v "$SHA1ZERO" | wc -l )
+
+    irst=0
+    
+	if [ "$PARTIAL" -eq "$PARTIAL" ] 2>/dev/null
+	then
+	    if [ "$PARTIAL" -gt "$BLOCKCNT" ]
+	    then
+	    	echo "Error: invalid partial count $PARTIAL, exceeds block count $BLOCKCNT"
+	    	drawline
+	    	exit 0	
+	    fi
+	    irst=$(( ${PARTIAL}-1 ))
+	    if [ "${irst}" -gt "5" ]
+	    then
+		ISPARTIAL=1	
+		echo "Attention!: a previous restore attempt has been detected"
+		echo "(c)XSITools will resume the operation at block ${irst}"
+		drawline
+	    else
+		irst=0	
+	    fi
+	else
+	    writeout "Error: ($PARTIAL) cannot be evaluated as an integer"
+	    writeout "Please, perform a full restore instead"
+	    drawline
+	    exit 0
+	fi	
+    
+    restoredsk=0
+    if [ "$5" != "" ]
+    then
+	partial="$5"
+    else
+    	partial="0"
+    fi	
+    if [ "$partial" -eq "1" -a "$PARTIAL" -eq "0" ]
+    then	
+	writeout "Disk <${FILENAME}> is complete, skipping"
+	drawline
+    fi
+    if [ "$partial" -eq "1" -a "$PARTIAL" -gt "0" ]
+    then
+    	if [ ! -f "$3" ]
+    	then
+    	    writeout "Can't find disk <${FILENAME}>"
+    	else
+            writeout "Resuming disk <${FILENAME}> transfer"
+            restoredsk=1	
+        fi
+        drawline
+    fi
+    if [ "$partial" -eq "0" ]
+    then	
+	restoredsk=1
+    fi	
+    if [ "$restoredsk" -eq "1" ]
+    then
+	writeout "Restoring ${BLOCKCNT} blocks"
+	drawline
+	
+        SUBBLKSIZ=1048576
+        SUBBLKCNT=$(( $BLOCKSIZE/$SUBBLKSIZ ))
+
+        writeout "File size: $FILESIZE"
+	drawline
+
+	TMPFile="/tmp/xsitools.tmp"	
+
+	# 1M block count
+	COUNT=$( python -c "print(int($FILESIZE/1048576))" )
+	if [ "$irst" -eq "0" ]
+	then
+	    writeout "Creating restore file..."
+	    # 1M block array # "$DDBIN" of="$3" bs=1048576 seek=$COUNT count=0
+	    "$DDBIN" of="$3" bs=1 seek=${FILESIZE} count=0
+	    drawline
+	    writeout "Restore file created, size: $( ls -las "$3" | awk '{print $6}' )"
+	    drawline
+	else
+	    if [ ! -f "$3" ]
+	    then
+	    	writeout "Error: cannot find the partially written restore file $3"
+	    	drawline
+	    	exit 0
+	    else
+	    	ISPARTIAL=1
+	    fi    	
+	fi
+	# LZOP only extracts 4k at a time, so we have to deal with that
+	# DDCOUNT=$(( $BLOCKSIZE/4096 ))	
+	
+	GO=0
+	START=$(date +%s)
+	nzblks=0
+	nmblks=0
+	HASHES="$( cat "${FILEPATH}${FNAPP}" )"
+	IFS=${newline}
+	for hash in ${HASHES}
+	do
+	    GO=0
+	    if [ "${ISPARTIAL}" -eq "1" -a "${nmblks}" -ge "${irst}" ]
+	    then
+	  	GO=1  	
+	    fi
+	    if [ "${ISPARTIAL}" -eq "0" ]
+	    then
+	    	GO=1
+	    fi
+	    if [ "${GO}" -eq "1" ]
+	    then
+	    	echo "$irst" > "$3".partial
+	    	if [ "$irst" -eq "$(( $BLOCKCNT-1 ))" ]
+	    	then
+	    	    #INXS=$( python -c "print ('0') if ($FILESIZE/float($SUBBLKSIZ))==(int($FILESIZE/$SUBBLKSIZ)) else ('1')" )
+	    	    SUBBLKCNT=$(( ${FILESIZE}%${BLOCKSIZE}/${SUBBLKSIZ}+1 ))	 
+	    	fi
+	    	echo -ne "Processed $(( $(( $irst+1 ))*100/$BLOCKCNT ))% | block $(( ${irst}+1 )) out of ${BLOCKCNT}\033[0K\r"
+            	FstL=${hash:0:1}
+            	SndL=${hash:1:1}
+	    	TrdL=${hash:2:1}
+            	HASHDIR="$DTTARGET"/"$FstL"/"$SndL"/"$TrdL"
+	    	if [ "$hash" != "$SHA1ZERO" ]
+	    	then
+		    if [ "${RT}" == "remote" ]
+		    then
+		    	if [ "$BLOCKCOMP" != "1" ]
+		    	then
+		    	    RSYNCOUT="$( ( "$PWD/bin/xsibackup-rsync" -aq --whole-file --rsh="ssh $SSHOPTS -p${PO}" --rsync-path="$RMRSYNCPATH" ${defremusr}@${IP}:"$HASHDIR/$hash" "$TMPFile" ) 2>&1 >/dev/null )"
+		    	    "$DDBIN" conv=notrunc if="${TMPFile}" of="$3" bs=$SUBBLKSIZ count=$SUBBLKCNT seek=$(( $irst*$SUBBLKCNT )) 2>>"$RETARGET"/xsitools-dd.log
+		    	else
+		            RSYNCOUT="$( ( "$PWD/bin/xsibackup-rsync" -aq --whole-file --rsh="ssh $SSHOPTS -p${PO}" --rsync-path="$RMRSYNCPATH" ${defremusr}@${IP}:"$HASHDIR/$hash" "$TMPFile" ) 2>&1 >/dev/null )"
+		            rm -rf "${TMPFile}.out" && "$LZBIN" -d "$TMPFile" 
+		            "$DDBIN" conv=notrunc if="${TMPFile}.out" of="$3" bs=$SUBBLKSIZ count=$SUBBLKCNT seek=$(( $irst*$SUBBLKCNT )) 2>>"$RETARGET"/xsitools-dd.log
+		    	fi	
+		    else	    	
+	    	    	if [ -f "$HASHDIR/$hash" ]
+	    	    	then    
+	    	            if [ "$BLOCKCOMP" != "1" ]
+	    	            then
+	    	    	    	"$DDBIN" conv=notrunc if="$HASHDIR/$hash" of="$3" bs=$SUBBLKSIZ count=$SUBBLKCNT seek=$(( $irst*$SUBBLKCNT )) 2>"$RETARGET"/xsitools-dd.log
+	    	            else
+	    	            	"$LZBIN" -d -ff < "$HASHDIR/$hash" | cat > "$TMPFile"
+	    	            	"$DDBIN" conv=notrunc if="$TMPFile" of="$3" bs=$SUBBLKSIZ count=$SUBBLKCNT seek=$(( $irst*$SUBBLKCNT )) 2>>"$RETARGET"/xsitools-dd.log
+	    	       	    fi	
+	    	    	else
+	    	            writeout "Broken backup, missing chunk $hash"
+	    	        fi
+		    fi
+	    	fi	
+	    irst=$(( $irst+1 ))
+	    fi
+	nmblks=$(( $nmblks+1 ))    	
+	done
+	IFS=$OLDIFS
+
+	if [ "$irst" -eq "$BLOCKCNT" ]
+	then
+	    rm -rf "$3".partial
+	fi
+	rm -rf /tmp/xsibackup*
+        END=$(date +%s)
+        TIMEDIFF=$(( $END - $START + 1 ))
+        echo -e "\nTime taken: ${TIMEDIFF} seconds"
+        echo "Speed: $(( ${NONZEROB}*${BLOCKSIZE}/1024/1024/${TIMEDIFF} ))/$(( ${FILESIZE}/1024/1024/${TIMEDIFF} )) Mb/s"
+
+    fi	
+fi
+
+}

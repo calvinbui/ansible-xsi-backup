@@ -1,6 +1,6 @@
 ---
 
-xsibackup_version: 11.0.1
+xsibackup_version: 11.2.5
 xsibackup_working_dir: /vmfs/volumes/files/Misc/Test
 xsibackup_backup_dir: "{{ xsibackup_working_dir }}/Backups"
 xsibackup_jobs:

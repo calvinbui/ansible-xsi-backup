@@ -1,0 +1,8 @@
+# [TITLE] = SMTP Server
+# You can add as many SMTP servers as you want
+# Columns are separated by colons as described below
+# One server per line pledging to the following format (please, do note that the server IP or FQDN and port are separated by a colon)
+# ORDINAL(integer);--smtp-srv(IP or FQDN):--smtp-port;--mail-from;--smtp-usr;--smtp-pwd;--smtp-auth(none|anystring);--smtp-sec(TLS|anystring);--smtp-delay(0-4 sec) 
+# Do not parse any --smtp-delay unless you need it 0 is OK, only first 8 fields are mandatory
+# Example
+# 1;smtp.gmail.com:465;youremail@gmail.com;youremail@gmail.com;Y0urpassw0rd;yes;TLS;0

@@ -1,0 +1,9 @@
+if [ -d "$PWD/src/pro" ]
+then
+    APPNAM="XSIBACKUP-PRO"
+else
+    APPNAM="XSIBACKUP-FREE"
+fi    
+APPVER="11.2.4"
+APPCOM="(c) VMWARE ESXi Hypervisor"
+borgversions="1.1.1"

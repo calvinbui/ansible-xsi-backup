@@ -1,0 +1,1020 @@
+unregVM(){
+    vmNAM="$1"	
+    # We must also detect whether the remote VM is registered and unregister it
+    if [ "$SERVERTYPE" = "NET" ]
+    then
+        ISREG="$( eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "vim-cmd vmsvc/getallvms | awk '\$2 == \"${vmNAM}\" || \$2 == \"${vmNAM}_XSIBAK\"' | awk '{print \$1}'" )"
+        NUMRG="$( echo "${ISREG}" | wc -l )"
+        for nr in $ISREG
+        do
+            UNREG="$( eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "vim-cmd vmsvc/unregister ${nr}" )"
+            UNREG="$( echo "$UNREG" | sed '/FIPS mode initialized/d' )"
+            if [ "${UNREG}" == "" ]
+            then
+                writeout "[$vmNAM] info: unregistered previous VM by that name"
+                drawline
+            else
+                writeout "[$vmNAM] info: couldn't unregistered previous VM by that name"
+                drawline
+            fi
+        done
+    else
+        ISREG="$( vim-cmd vmsvc/getallvms | awk '$2 == "${vmNAM}" || $2 == "${vmNAM}_XSIBAK"' | awk '{print $1}' )"
+        NUMRG="$( echo "${ISREG}" | wc -l )"
+        for nr in $ISREG
+        do
+            UNREG="$( vim-cmd vmsvc/unregister ${nr} )"
+            if [ "${UNREG}" == "" ]
+            then
+                writeout "[$vmNAM] info: unregistered previous VM by that name"
+                drawline
+            else
+                writeout "[$vmNAM] info: couldn't unregistered previous VM by that name"
+                drawline
+            fi
+        done
+    fi
+}
+
+diffVM(){
+
+#DDBIN="$PWD/bin/dd"
+DDBIN="dd"
+CHKMB=$trivialcheck
+
+if [ "$backupprog" = "onediff" ]
+then
+    REINIT_ONEDIFF=0	
+	if [ ! -z "$datedir" ]
+	then
+	    writeout "\033[0;36mRemember: --date-dir argument will be ignored in OneDiff backups\033[0m"	
+	    drawline	
+	fi
+
+        if NAM=$( getVMName $1)
+        then
+            cloneMsg="\033[0;36mVM name:\033[0m $NAM\n"
+        else
+            ERR DIFNAMER "Error getting VM name for VM Id: $1"
+        fi
+
+        VMPID=$( ps | grep "$NAM" | awk '{print $2}' | head -n1 )
+
+        if VMXDir=$( getVMXDir "$1" )
+        then
+            cloneMsg="\033[0;36mVMX file directory:\033[0m \"$VMXDir\"\n"
+        else
+            ERR DIFVMXER "Error getting VMX file directory for: $NAM"
+        fi
+
+        if VMD=$( getVMDir $1 )
+        then
+            cloneMsg="\033[0;36mVM directory:\033[0m $VMD\n"
+        else
+            ERR DIFVMDER "Error getting VM directory for VM Id: $1"
+        fi
+
+        if [ "${backuppoint:0:1}" = "/" ]
+        then
+            bpds=$( echo "$backuppoint" | awk -F '/' '{print "/"$2"/"$3"/"$4}' )
+            vmds=$( echo "$VMXDir" | awk -F '/' '{print "/"$2"/"$3"/"$4}' )
+            if [ "$vmds" == "$bpds" ]
+            then
+                writeout "\033[0;31m[$NAM] error DIFDUPDS: you cannot OneDiff to the same data store, you would overwrite your VM\033[0m"
+                ERR DIFDUPDS "[$NAM] error: you cannot OneDiff to the same data store, you would overwrite your VM"
+            	xsib_shutdown
+            fi
+        fi
+
+	datedir="no"
+	VMXFILEPATH=$( ls "$VMXDir/"*".vmx" )
+	DEBUGINFO="${DEBUGINFO}<br />VMXFILEPATH: $VMXFILEPATH"
+
+        # Get HW version
+        HWVer=$( cat "$VMXFILEPATH" | grep virtualHW.version | awk -F '=' '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' -e 's/\"//g' )
+        if [ "$REMESXiVers" != "" ]
+        then
+            check_hwver "$REMESXiVers" "$HWVer"
+        fi
+
+	VMXFILEDIRE=$( dirname "$VMXFILEPATH"  )
+	VMXFILENAME=$( basename "$VMXFILEPATH" )
+	if [ "$SERVERTYPE" = "NET" ]
+	then
+	    backuppath="$baksrvdire"
+	else
+	    backuppath="$backuppoint"
+	fi
+
+	# Delete remote dir
+	# rmremdir function will detect if the dir has to be deleted
+	rmremdir "${backuppath}"/"${NAM}"
+
+	REMOTEVMXPATH="${backuppath}"/"${NAM}"/"${VMXFILENAME}"
+	REMOTEVMXDIR=$( dirname "$REMOTEVMXPATH" )
+	VMSDFILEPATH=$( ls "$VMXDir/"*".vmsd" )
+	VMSDFILENAME=$( basename "$VMSDFILEPATH" )
+	VMSDFILECONT=$( cat "$VMSDFILEPATH" )
+	REMOTEVMSDPATH="${backuppath}"/"${NAM}"/"${VMSDFILENAME}"
+
+        INDEPENDENTNUM=$( cat "$VMXFILEPATH" | grep ".mode = \"independent-" | wc -l )
+        INDEPENDENTDSK=$( cat "$VMXFILEPATH" | grep ".mode = \"independent-" | awk -F "." '{print $1}' )
+
+	if [ "$VMSTAT" == "ON" ] && [ $INDEPENDENTNUM -gt 0 ]
+	then	
+	    THEEXCLUSIONS2=""
+	    for inddisk in $INDEPENDENTDSK
+	    do
+	    	toexclude=$( cat "$VMXFILEPATH" | grep "$inddisk".fileName | awk -F "=" '{print $2}' | sed 's/\"//g' | sed -e 's/^ *//g' -e 's/ *$//g' )
+	    	if [ "${toexclude:0:1}" == "/" ]
+	    	then
+	    	    toexclude=$( basename "$toexclude" )
+	    	fi
+	    	THEEXCLUSIONS2=${toexclude}";"${THEEXCLUSIONS2}    	
+	    done		
+	    THEEXCLUSIONS2="$( echo "${THEEXCLUSIONS2}" | sed -e 's/^;//g' -e 's/;$//g' )"	
+	    if [ "${THEEXCLUSIONS2}" != "" ]
+	    then
+	    	writeout "Some independent disks were detected: [${THEEXCLUSIONS2}]"
+	    	writeout "They will be excluded from the backup and the target VM"
+	    	drawline
+	    fi	
+	fi
+
+	THEEXCLUSIONS="${2};${THEEXCLUSIONS2}"
+	THEEXCLUSIONS="$( echo "${THEEXCLUSIONS}" | sed -e 's/^;//g' -e 's/;$//g' )"
+	
+	LOCALDISKS=$( cat "$VMXFILEPATH" | grep .vmdk | awk -F ' = ' '{print $2}' | sed -e 's/\"//g' | sed -r 's/[-][0-9]{6}.vmdk/.vmdk/g' | sed 's/.vmdk/-flat.vmdk/g' )	
+	if [ "$SERVERTYPE" = "NET" ]
+	then
+	    REMOTEDISKS=$( eval ssh "$SSHOPTS" -p"$baksrvport" ${defremusr}@"$baksrvaddr" "if [ -d \\\"${REMOTEVMXDIR}\\\" ]\;then ls -1 \\\"${REMOTEVMXDIR}\\\" \| grep \\\"flat.vmdk\\\"\;fi" )
+	    REMOTEDISKS="$( echo "$REMOTEDISKS" | sed '/FIPS mode initialized/d' )" 
+	else
+	    REMOTEDISKS=$( if [ -d "${REMOTEVMXDIR}" ];then ls -1 "${REMOTEVMXDIR}" | grep "flat.vmdk";fi )
+	fi
+	REINIT_ONEDIFF=0
+	missingdsk=0
+	IFS=$newline
+	for ldisk in $LOCALDISKS
+	do		
+	    if [ "${ldisk:0:1}" != "/" ]
+	    then
+		labspath="$VMXFILEDIRE"/"$ldisk"
+		lfname="$ldisk"	
+	    else
+		labspath="$ldisk"
+		lfname="$( basename "$ldisk" )"
+	    fi
+	    local_vmdk_descriptor="${lfname/-flat.vmdk/.vmdk}"
+	    if [ "${THEEXCLUSIONS//$local_vmdk_descriptor/}" == "$THEEXCLUSIONS" ]
+	    then					
+		remotefound=0
+		IFS=$newline
+		for rdsk in $REMOTEDISKS
+		do				    
+		    if [ "$lfname" == "$rdsk" ]
+		    then
+		    	remotefound=1
+		    fi        
+		done
+		if [ "$remotefound" -eq "0" ]
+		then
+		    REINIT_ONEDIFF=1
+		    writeout "\033[0;36m[$NAM] notice DIFRMMIS: no [$lfname] in remote OneDiff mirror, first run?.\033[0m"	
+		    drawline	
+		else
+		    if [ "$SERVERTYPE" = "NET" ]
+		    then
+			VMDKLOCATIO="$baksrvaddr":"$baksrvport":"${REMOTEVMXDIR}"/"$lfname"
+		    else
+			VMDKLOCATIO="$labspath"
+		    fi
+
+		    writeout "[$NAM] info: quick size check..."						    
+		    drawline	
+		    writeout "[$NAM] info: file [$lfname]..."
+		    drawline 		
+		    local_file_size=$( ls -la "$labspath" | awk '{print $5}' )
+		    if [ "$SERVERTYPE" = "NET" ]
+		    then
+		        remot_file_size=$( eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "ls -la \"${REMOTEVMXDIR//\ /\\ }/${lfname//\ /\\ }\" | awk '{print \$5}'" )
+		       	remot_file_size="$( echo "$remot_file_size" | sed '/FIPS mode initialized/d' )"
+		    else
+		    	remot_file_size=$( ls -la "${REMOTEVMXDIR}/$lfname" | awk '{print $5}' )
+		    fi
+		    if [ "$local_file_size" == "$remot_file_size" ]
+		    then
+			writeout "[$NAM] info: file size check | \033[0;32mOK\033[0m [ ${local_file_size} bytes | ${remot_file_size} bytes ]"
+		    	drawline
+		    else
+			REINIT_ONEDIFF=1
+			writeout "\033[0;36m[$NAM] warning DIFQCSZ0: OneDiff mirror .vmdk size check fail, OneDiff mirror will be initialized\033[0m..."
+		    	drawline
+		    fi
+		fi
+	    fi
+	done
+	IFS=$OLDIFS	
+	if [ -f "$VMSDFILEPATH" ]
+        then
+		snapn="0"        	
+        	# We get the number of snapshots
+                snapn=$( grep snapshot.numSnapshots "$VMSDFILEPATH" | awk -F "=" '{print $2}' )
+                snapn=${snapn// /}
+                snapn=${snapn//\"/}
+                
+                # And look for the -xsibackupdiff- snapshot
+                snapx=$( grep "snapshot0.displayName = \"xsibackupdiff\"" "$VMSDFILEPATH" | awk -F "=" '{print $2}' )
+                snapx=${snapx// /}
+                snapx=${snapx//\"/}
+               
+                SYSTEMDISK1=$( cat "$VMXFILEPATH" | grep vmdk | sort | head -n1 | awk -F '=' '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' | sed 's/\"//g' | sed -r 's/[-][0-9]{6}.vmdk/.vmdk/g' )
+                if [ "${SYSTEMDISK1:0:1}" = "/"  ]
+                then
+                    SYSTEMDISK1="$SYSTEMDISK1"
+                else
+                    SYSTEMDISK1="$VMXDir"/"$SYSTEMDISK1"
+                fi
+
+                CHANGEDCID="1"
+
+		REMOTEVMXEXISTS=0
+		if [ "$SERVERTYPE" = "DIR" ]
+		then
+		    if [ -f "$REMOTEVMXPATH" ]
+		    then
+		    	REMOTEVMXEXISTS=1	
+		    else
+		    	REMOTEVMXEXISTS=0
+		    fi	
+		else
+		    REMOTEVMX="$( eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "ls \"${REMOTEVMXPATH//\ /\\ }\" 2>/dev/null | wc -l" )"
+		    REMOTEVMX="$( echo "$REMOTEVMX" | sed '/FIPS mode initialized/d' )"
+		    if [ "$REMOTEVMX" -gt "0" ]
+		    then 
+		    	REMOTEVMXEXISTS=1
+		    else
+		    	REMOTEVMXEXISTS=0
+		    fi
+		fi
+
+		if [ $REMOTEVMXEXISTS -eq 1 ]
+		then
+		    if [ "$SERVERTYPE" = "NET" ]
+		    then
+		   	srvpart="$baksrvaddr":"$baksrvport":
+		    fi
+		    DEBUGINFO="${DEBUGINFO}<br />&bull;&nbsp;VM ${NAM} remote VMX path exists at:&nbsp;${srvpart}${REMOTEVMXPATH}"
+		    if [ "$SERVERTYPE" = "NET" ]
+		    then
+		    	REMOTEVMXSZ=$( eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "ls -las \"${REMOTEVMXPATH//\ /\\ }\" | awk '{print \$6}'" )
+		    	REMOTEVMXSZ="$( echo "$REMOTEVMXSZ" | sed '/FIPS mode initialized/d' )"
+			REMOTEVMX=$( eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "cat \"${REMOTEVMXPATH//\ /\\ }\" 2>/dev/null" )
+			REMOTEVMX="$( echo "$REMOTEVMX" | sed '/FIPS mode initialized/d' )"
+			SYSTEMDISK2=$( echo "$REMOTEVMX" | grep vmdk | sort | head -n1 | awk -F '=' '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' | sed 's/\"//g' | sed -r 's/[-][0-9]{6}.vmdk/.vmdk/g' )    	
+		    else
+		        REMOTEVMXSZ=$( ls -las "${REMOTEVMXPATH}" | awk '{print $6}' )
+		    	SYSTEMDISK2=$( cat "$REMOTEVMXPATH" | grep vmdk | sort | head -n1 | awk -F '=' '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' | sed 's/\"//g' | sed -r 's/[-][0-9]{6}.vmdk/.vmdk/g' )
+		    fi
+		    writeout "[$NAM] info: remote VMX file size ${REMOTEVMXSZ}"
+		    drawline
+		    if [ "${SYSTEMDISK2:0:1}" = "/"  ]
+		    then
+		    	SYSTEMDISK2="$SYSTEMDISK2"
+		    else
+		    	SYSTEMDISK2="$REMOTEVMXDIR"/"$SYSTEMDISK2"
+		    fi
+		    
+		    if [ "$SERVERTYPE" = "NET" ]
+		    then
+		   	SYSDISK2N="$( eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "ls \"${SYSTEMDISK2//\ /\\ }\" 2>/dev/null | wc -l" )"
+			SYSDISK2N="$( echo "$SYSDISK2N" | sed '/FIPS mode initialized/d' )"
+			if [ "$SYSDISK2N" -gt "0" ]
+		   	then
+		   	    SYSDISK2EXISTS=1
+		   	else
+		   	    SYSDISK2EXISTS=0	
+		   	fi
+		    else
+		    	if [ -f "$SYSTEMDISK2" ]
+		    	then
+		    	    SYSDISK2EXISTS=1
+		    	else
+		    	    SYSDISK2EXISTS=0
+		    	fi
+		    fi
+
+		    if [ -f "$SYSTEMDISK1" -a "$SYSDISK2EXISTS" -eq "1" ]
+		    then
+			DEBUGINFO="${DEBUGINFO}<br />&bull;&nbsp;VM ${NAM} SYS DISK1 EXISTS:&nbsp;${SYSTEMDISK1}"
+			DEBUGINFO="${DEBUGINFO}<br />&bull;&nbsp;VM ${NAM} SYS DISK2 EXISTS:&nbsp;${SYSTEMDISK2}"
+			
+			CID1=$( cat "$SYSTEMDISK1" | grep ^CID= | awk -F "=" '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' | sed 's/\"//g' )
+			if [ "$CID1" == "" ]
+			then
+			    writeout "\033[0;31mUnrecoverable error: cannot determine CID of system disk, the backup will halt\033[0m"
+			    writeout "\033[1;31mCID must be present at the .vmdk descriptor file, check file ["$SYSTEMDISK1"] exists\033[0m"
+			fi
+			
+			if [ "$SERVERTYPE" = "NET" ]
+			then
+			    REMOTEVMDK=$( eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "cat \"${SYSTEMDISK2//\ /\\ }\"" )	
+			    REMOTEVMDK="$( echo "$REMOTEVMDK" | sed '/FIPS mode initialized/d' )"
+			    CID2=$( echo "$REMOTEVMDK" | grep ^CID= | awk -F "=" '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' | sed 's/\"//g' )
+			else
+			    CID2=$( cat "$SYSTEMDISK2" | grep ^CID= | awk -F "=" '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' | sed 's/\"//g' )	
+			fi
+			
+			DEBUGINFO="${DEBUGINFO}<br />&bull;&nbsp;VM ${NAM} CID1:&nbsp;${CID1}"
+			DEBUGINFO="${DEBUGINFO}<br />&bull;&nbsp;VM ${NAM} CID2:&nbsp;${CID2}"
+
+                        QUIESCEDWINDOWS=0
+			writeout "System disk CIDs ${CID1}|${CID2}"
+			drawline
+			if [ "$CID1" != "$CID2" ]
+			then
+			    CHANGEDCID="1"
+			    writeout "The system disk CID has changed, OneDiff backup will be initialized and a full backup made..."
+			    drawline
+			else
+			    CHANGEDCID="0"
+			fi
+		    else
+		    	if [ ! -f "$SYSTEMDISK1" ]
+		    	then
+		    	    writeout "\033[0;31mMissing source system disk: [$SYSTEMDISK1]\033[0m"
+		    	    drawline	
+		    	fi
+		    	if [ "$SYSDISK2EXISTS" == "0" ]
+		    	then
+		    	    writeout "\033[0;31mMissing target system disk: [$SYSTEMDISK2]\033[0m"
+		    	    drawline
+		    	    ERR DIFMISD2 "[$NAM] error: missing file [$SYSTEMDISK2]"
+		    	fi
+		    	DEBUGINFO="${DEBUGINFO}<br />&bull;&nbsp;VM ${NAM} ONE SYS DISK MISSING:"
+		    	DEBUGINFO="${DEBUGINFO}<br />&bull;&nbsp;VM ${NAM} MISSING DISK1?:&nbsp;${SYSTEMDISK1}"
+		    	DEBUGINFO="${DEBUGINFO}<br />&bull;&nbsp;VM ${NAM} MISSING DISK2?:&nbsp;${SYSTEMDISK2}"
+		    fi
+		else
+		    DEBUGINFO="${DEBUGINFO}<br />&bull;&nbsp;VM ${NAM} remote vmx file does not exist. Nothing to worry if this is the 1st OneDiff:&nbsp;${REMOTEVMXPATH}"	
+		fi
+
+		DEBUGINFO="${DEBUGINFO}<br />&bull;&nbsp;VM ${NAM} CID:&nbsp;${CHANGEDCID}"
+		DEBUGINFO="${DEBUGINFO}<br />&bull;&nbsp;VM ${NAM} SNAPSHOT:&nbsp;${snapx}"
+		DEBUGINFO="${DEBUGINFO}<br />&bull;&nbsp;VM ${NAM} SNAPSHOT NUM:&nbsp;${snapn}"
+
+        	# If there is only one snapshot and it is called [xsibackupdiff], and the remote dir and VMX file exist
+                # and the CIDs of the VMDK base disks are the same => then the VM is already engaged in a diff backup
+	
+		writeout "\e[1m[$NAM] (c) OneDiff algorithm\033[0m"
+		drawline
+
+                if [ "$snapx" = "xsibackupdiff" -a "$snapn" = "1" -a "$SYSDISK2EXISTS" == "1" -a "$CHANGEDCID" == "0" -a "$REINIT_ONEDIFF" -eq "0" ]
+                then
+		    writeout "\033[0;32mMirror VM exists and the system disks CID are the same, starting OneDiff...\033[0m"
+		    drawline
+			# Get the VMSD AND VMX contents at this moment
+                	XSIBAKDIFFVMSD=$( cat "$VMSDFILEPATH" )
+                	XSIBAKDIFFVMX=$( cat "$VMXFILEPATH" )
+			writeout "[$NAM] info: length of .vmx file before OneDiff phase is ${#XSIBAKDIFFVMX}"
+			# We get the ordinal
+                	snapo=$( grep snapshot0.description "$VMSDFILEPATH" | awk -F "=" '{print $2}' | awk '{print $2}' )
+                	snapo=${snapo//\"/}
+                	DIFFBACKUPNUM=$(( $snapo+1 ))
+                	# We rename it
+                        ren=$( sed -i -e 's|snapshot0.displayName = "xsibackupdiff"|snapshot0.displayName = "xsibackuphot"|' "$VMXDir/"*".vmsd" & vim-cmd vmsvc/reload $1 )
+                        if [ "$ren" != "" ]
+                        then
+                            writeout "\033[0;31m[$NAM] error DIFRENSN: error renaming snapshot\033[0m"
+                            ERR DIFRENSN "[$NAM] error: failed renaming snapshot, details: $ren"	
+                        fi
+                else
+                	# If there is more than one snapshot in the VM, or there aren't any snapshots at all or the mirror VM
+                        # does not exist, or CIDs are different then the VM has not previously been backed up with diff method
+                        echo "[$NAM] info: OneDiff backup first run, removing snapshots"
+                        REMSNAP=$( vim-cmd vmsvc/snapshot.removeall $1 )
+                        if [ "$REMSNAP" != "Remove All Snapshots:" ]
+                        then
+                            writeout "\033[0;31m[$NAM] error DIFREMSN: cannot remove all snapshots, details: $REMSNAP\033[0m"
+			    ERR DIFREMSN "[$NAM] error: cannot remove all snapshots, details: $REMSNAP"
+			else
+                            echo "[$NAM] info: all snapshots removed"
+                        fi
+                        DIFFBACKUPNUM=1
+                	#VMXFILECONTENT=$( cat "$VMXFILEPATH" )
+                	VMXFILECONTENTPATH="/tmp/${NAM// /-}_vmx_file"
+                	cat "$VMXFILEPATH" > "$VMXFILECONTENTPATH"
+                fi
+		
+		drawline
+		writeout "Snapshot & Quiescing"
+		drawline
+		QUIESCEIT="0"
+		
+		if [ "$3" = "toolsOk" ]
+		then
+                    if [ "$QUIESCEVM" -eq "0" ]
+                    then
+                        writeout "[$NAM] info: VMWare Tools detected, taking snapshot QUIESCED(false)..."
+                        writeout "[$NAM] info: set argument --snapshot=doquiesce to quiesce your VMs"
+                        drawline
+                        qs="0"
+                    elif [ "$QUIESCEVM" -eq "1" ]
+                    then
+                        qs="1"
+                        if [ "$APPNAM" == "XSIBACKUP-FREE" ]
+                        then
+                            if [ "$( isWindows $1 )" -gt "0" ]
+                            then
+                                qs="0"
+                                QUIESCEVM=0
+                                up2Pro "Windows quiescing"
+                            fi
+                        else
+                            writeout "[$NAM] info: VMWare Tools detected, taking snapshot QUIESCED(true)..."
+                            drawline
+                        fi
+                    fi		
+		else
+		    qs="0"
+		    QUIESCEMSG="NO (no tools detected)"
+		    writeout "[$NAM] info: the VM will not be quiesced, no tools detected"	
+		fi
+			
+		writeout "[$NAM] info: round $DIFFBACKUPNUM"
+		drawline
+		if [ "$DIFFBACKUPNUM" -gt "7" -a "$APPNAM" == "XSIBACKUP-FREE" ]
+		then
+		    up2Pro "[$NAM] info: more than 7 (c) OneDiff backup cycles"
+		    xsib_shutdown	
+		fi
+
+                CREATESNAP=$( ( vim-cmd vmsvc/snapshot.create $1 xsibackupdiff "xsibackupdiff $DIFFBACKUPNUM" 0 "$qs" ) 2>&1 )
+				sleep 5
+                if [ "$CREATESNAP" != "Create Snapshot:" ]
+                then
+                    writeout "\033[0;31m[$NAM] error DIFCRES1: create snapshot xsibackupdiff ($DIFFBACKUPNUM) failed\033[0m"
+                    ERR DIFCRES1 "[$NAM] error: cannot create snapshot xsibackupdiff ($DIFFBACKUPNUM), details: $CREATESNAP. Fix whatever issue is impeding your VM from being snapshotted."
+                
+                    if [ "$qs" -eq "1" ]
+                    then
+                        writeout "[$NAM] workaround: could not create quiesced snapshot, trying non-quiesced"
+						CREATESNAP2=$( ( vim-cmd vmsvc/snapshot.create $1 xsibackupdiff "xsibackupdiff $DIFFBACKUPNUM" 0 0 ) 2>&1 )
+                        if [ "$CREATESNAP2" != "Create Snapshot:" ]
+                        then
+                            writeout "[$NAM] error DIFCRES2: could not create workaround non-quiesced snapshot either, details: $CREATESNAP2"
+                            drawline
+                            ERR DIFCRES2 "[$NAM] error: cannot create workaround non-quiesced snapshot, details: $CREATESNAP2"
+                    	else
+                            writeout "[$NAM] warning DIFCRES3: non-quiesced snapshot taken as a workaround measure"
+                            drawline
+                            ERR DIFCRES3 "[$NAM] warning: non-quiesced snapshot taken as a workaround measure, details: $CREATESNAP2" W
+                        fi
+                    fi                
+                fi
+                    writeout "[$NAM] info: snapshot taken, quiescing status: $QUIESCEMSG"
+		    drawline
+                    
+			    CURRSTATE2="$( get_vm_state $1 )"	                    
+	                    if [ "$backuphow" == "warm" -a "$VMSTAT" == "ON" ]
+	                    then 
+	                    	if [ "$CURRSTATE2" == "OFF" ]
+	                    	then
+	                    	    POWRTN="$( vim-cmd vmsvc/power.on $1 )"
+	                    	    if [ "$POWRTN" != "Powering on VM:" ]
+	                    	    then
+	                    	    	writeout "\033[0;31m[$NAM] error POWONDF1: cannot power on VM, details: $POWRTN\033[0m"
+	                    	    	ERR POWONDF1 "[$NAM] error: cannot power on, details: $POWRTN"	
+	                    	    else
+	                    	      	writeout "[$NAM] info: bringing VM up again"
+	                    	      	drawline
+					writeout "[$NAM] info: sleeping 30 seconds to allow VM to boot..."
+					sleep 30
+					drawline
+	                    	    fi
+	                    	fi
+	                    fi
+
+                            # Copy xsibackuphot or do the first backup
+			    # We check in any case, whether it is the first whole copy or a diff
+			    # that backup VM exists
+			    REGISTERED="0"
+			    if [ "$SERVERTYPE" = "NET" ]
+			    then
+			        VMIDNUM=$( eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "vim-cmd vmsvc/getallvms | grep \" ${NAM//\ /\\ }_XSIBAK\"" | awk '{print $1}' )
+			        VMIDNUM="$( echo "$VMIDNUM" | sed '/FIPS mode initialized/d' )"
+			    else
+			        VMIDNUM=$( vim-cmd vmsvc/getallvms | grep " ${NAM}_XSIBAK" | awk '{print $1}' )
+			        if [ "$VMIDNUM" != "" ]
+				then
+				    writeout "INFO: found [${NAM}_XSIBAK] with Id: $VMIDNUM"
+			    	    drawline
+				fi
+			    fi
+			    	if [ "${VMIDNUM}" != "" ]
+			    	then
+			      	    REGISTERED="${VMIDNUM}"
+                                    if [ "$SERVERTYPE" = "NET" ]
+				    then
+					RDATAST=$( eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "vim-cmd vmsvc/getallvms | grep \" ${NAM//\ /\\ }_XSIBAK\" | awk -F '[' '{print \$2}' | awk -F ']' '{print \$1}'" )
+					RDATAST="$( echo "$RDATAST" | sed '/FIPS mode initialized/d' )"
+					RVMXPAZ=$( eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "vim-cmd vmsvc/getallvms | grep \" ${NAM//\ /\\ }_XSIBAK\" | awk -F '.vmx' '{print \$1}' | awk -F ']' '{print \$2}' | sed -e 's/^ *//g' -e 's/ *$//g'" )
+					RVMXPAZ="$( echo "$RVMXPAZ" | sed '/FIPS mode initialized/d' )"
+					RVMXPAZ=$( dirname "$RVMXPAZ" )
+					EXISTING_PATH="/vmfs/volumes/$RDATAST/$RVMXPAZ"
+				    else
+				    	EXISTING_PATH="$( getVMXDir $REGISTERED )"
+			    	    fi
+				    if [ "$EXISTING_PATH" != "" -a "$REMOTEVMXDIR" != "$EXISTING_PATH" ]
+				    then
+					writeout "Preexisting path: $EXISTING_PATH"
+					writeout "Current backup path: $REMOTEVMXDIR"		
+			    		writeout "\033[0;91mALERT: whatch out!, there already exists a ${NAM}_XSIBAK at $EXISTING_PATH\033[0m"
+					writeout "\033[0;91mYou are trying to make a OneDiff backup to a different path ($REMOTEVMXDIR)\033[0m"
+					writeout "\033[0;91mor you deleted the _XSIBAK virtual machine from disk, but did not unregister it in the inventory\033[0m"
+					writeout "\033[0;91mWe'll let this roll in sake of chain continuity, but you must fix this wrong situation ASAP\033[0m"
+				        drawline
+					ERR ONEDPAZ1 "Error: OneDiff sequence incoherence, current VM path ($REMOTEVMXDIR) does not match pre-existing ($EXISTING_PATH), please do fix this ASAP"  	
+				    fi
+			    	
+			    	fi
+				if [ "$DIFFBACKUPNUM" -eq "1" ]
+				then
+				    unregVM ${NAM}
+				    VMSDFILECONT=$( replaceAbsolutePaths "${VMSDFILECONT}" )
+				    if [ "$SERVERTYPE" = "NET" ]
+				    then
+				    	p="xsidiff"
+				    else
+				    	p="vmkfstools"
+				    fi 
+				    VMXFILECONTENT="$( cat "$VMXFILECONTENTPATH" )"
+				    VMXCONTENTCHCK="$( cat "$VMXFILECONTENTPATH" | head -n1 | head -n1 | openssl sha1 2>/dev/null | awk -F '=' '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' )"
+				    VMXCONTENTCHCK="$( echo "$VMXCONTENTCHCK" | sed '/FIPS mode initialized/d' )"
+				    if [ "$VMXCONTENTCHCK" != "ceaf52e31754afed35eae818740cd54fdaafef3f" ]
+				    then
+				    	writeout "\033[0;31m[$NAM] error OVMXCHK1: VMX file check 1 fail, details: first line in .vmx file is not [.encoding = \"UTF-8\"], has this file been manually modified/edited?\033[0m"
+				    	ERR OVMXCHK1 "[$NAM] error: VMX file check 1 fail"
+				    fi
+
+				    cloneVM $VMIDNU "$baksrvdire" "${2}" "$p" "$toolsStatus" "$VMSTAT" "$VMXFILECONTENT"
+				    rm -rf "$VMXFILECONTENTPATH"
+ 
+				    backupprog="onediff"
+
+				    if [ "$SERVERTYPE" = "NET" ]
+				    then
+					# Copy .vmx file to var
+					VMXFILECONT=$( eval ssh "$SSHOPTS" -p"$baksrvport" ${defremusr}@"$baksrvaddr" "cat \"${REMOTEVMXPATH//\ /\\ }\"" )
+					VMXFILECONT="$( echo "$VMXFILECONT" | sed '/FIPS mode initialized/d' )"
+					VMXCONTENTCHCK="$( echo "$VMXFILECONT" | head -n1 | head -n1 | openssl sha1 2>/dev/null | awk -F '=' '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' )"
+					VMXCONTENTCHCK="$( echo "$VMXCONTENTCHCK" | sed '/FIPS mode initialized/d' )"
+					if [ "$VMXCONTENTCHCK" != "ceaf52e31754afed35eae818740cd54fdaafef3f" ]
+					then
+					    writeout "\033[0;31m[$NAM] error OVMXCHK2: VMX file check 2 fail, details: first line in .vmx file is not [.encoding = \"UTF-8\"], has this file been manually modified/edited?\033[0m"
+					    ERR OVMXCHK2 "[$NAM] error: VMX file check 2 fail"
+					fi    
+					# Replace name
+					VMXCONT=$( echo "$VMXFILECONT" | sed "s/displayName = \"${NAM}\"/displayName = \"${NAM}_XSIBAK\"/g" )	
+					# Remove snapshot parts
+					VMXCONT=$( echo "$VMXCONT" | sed -r 's/[-][0-9]{6}.vmdk/.vmdk/g' )
+					# Copy to the other side
+					CPVMXCONT=$( ( echo "$VMXCONT" | eval ssh "$SSHOPTS" -p"$baksrvport" ${defremusr}@"$baksrvaddr" "cat \> \"${REMOTEVMXPATH// /\\ }\"" ) 2>&1 )
+					CPVMXCONT="$( echo "$CPVMXCONT" | sed '/FIPS mode initialized/d' )"
+					if [ "$CPVMXCONT" != "" ]
+					then
+					    writeout "\033[0;31m[$NAM] error CPVMXCNT: could not update VMX file in [${NAM}_XSIBAK], details: $CPVMXCONT\033[0m"
+					    ERR CPVMXCNT "[$NAM] error: could not update VMX file in [${NAM}_XSIBAK], details: $CPVMXCONT"
+					else
+					    writeout "[$NAM] info: VMX file processed and updated"    	
+					fi
+					VMXCONT=""
+					# Remove VMSD file. First copy, no need for it on the other side
+					DELVMSD=$( ( eval ssh "$SSHOPTS" -p"$baksrvport" ${defremusr}@"$baksrvaddr" "rm -rf \"${REMOTEVMSDPATH// /\\ }\"" ) 2>&1 )
+				    	DELVMSD="$( echo "$DELVMSD" | sed '/FIPS mode initialized/d' )"
+					if [ "$DELVMSD" != "" ]
+				    	then
+				    	    writeout "\033[0;31m[$NAM] error DIFDVMSD: could not delete VMSD file in [${NAM}_XSIBAK], details: $DELVMSD\033[0m"
+				    	    ERR DIFDVMSD "[$NAM] error: could not delete VMSD file in [${NAM}_XSIBAK], details: $DELVMSD"
+				    	fi
+				    else
+					REPLACENAME=$( sed -i "s/displayName = \"${NAM}\"/displayName = \"${NAM}_XSIBAK\"/g" "${REMOTEVMXPATH}" )
+				    	if [ "$REPLACENAME" != "" ]
+				    	then
+				    	    writeout "\033[0;31m[$NAM] error DIFRENAM: could not rename [${NAM}] to [${NAM}_XSIBAK], details: $REPLACENAME\033[0m"	
+				    	    ERR DIFRENAM "[$NAM] error: could not rename [${NAM}] to [${NAM}_XSIBAK], details: $REPLACENAME"
+				    	fi
+				    	SETBASEDISKS=$( sed -i -r 's/[-][0-9]{6}.vmdk/.vmdk/g' "${REMOTEVMXPATH}" )
+				        if [ "$SETBASEDISKS" != "" ]
+				        then
+				       	    writeout "\033[0;31m[$NAM] error DIFREFZO: could not remove [-000000], details: $SETBASEDISKS\033[0m"
+				       	    ERR DIFREFZO "[$NAM] error: could not remove [-000000], details: $SETBASEDISKS" 
+				        fi
+					if [ "$( echo "$verifiedefivmdk" | wc -l )" -eq "0" ]    
+					then
+					    # Remove VMSD file. First copy, no need for it on the other side, unless we have EFI files
+					    DELVMSD="$( rm -rf "$REMOTEVMSDPATH" )"
+					    if [ "$DELVMSD" != "" ]
+					    then
+					    	writeout "\033[0;31m[$NAM] error DREMVMSD: could not remove .vmsd file from cloned VM, details: $DELVMSD\033[0m"
+					    	ERR DREMVMSD "[$NAM] error: could not remove .vmsd file from cloned VM, details: $DELVMSD"	
+					    fi
+					fi
+				    fi
+
+		                     # And now update the remote vmdk file for the CIDs to be equal
+		                     XSIBAKSYSVMDK=$( cat "$SYSTEMDISK1" )
+		                     SYSTEMDISK2="${REMOTEVMXDIR}/$( basename "$SYSTEMDISK1" )"
+		                     if [ "$SERVERTYPE" = "NET" ]
+		                     then
+		                         writeout "[$NAM] info: Updating CID at [$baksrvaddr:$baksrvport:${SYSTEMDISK2}]"
+		                         COPYSYS1=$( ( echo "$XSIBAKSYSVMDK" | eval ssh "$SSHOPTS" -p"$baksrvport" ${defremusr}@"$baksrvaddr" "cat \> \"${SYSTEMDISK2//\ /\\ }\"" ) 2>&1 )
+		                         COPYSYS1="$( echo "$COPYSYS1" | sed '/FIPS mode initialized/d' )"
+				     else
+		                         writeout "[$NAM] info: Updating CID at [${SYSTEMDISK2}]"
+		                         COPYSYS1=$( echo "${XSIBAKSYSVMDK}" > "${SYSTEMDISK2}" )
+		                     fi
+		                     if [ "$COPYSYS1" != "" ]
+		                     then
+		                         REINIT_ONEDIFF=1
+		                         writeout "\033[0;31m[$NAM] error DIFUPCID: cannot update CID at VM [${NAM}_XSIBAK], details: $COPYSYS1\033[0m"
+		                         ERR DFUPCID0 "[$NAM] error: cannot update CID at VM [${NAM}_XSIBAK], details: $COPYSYS1"
+		                     else
+		                         writeout "[$NAM] info: finished OneDiff backup, CID updated"
+		                     fi
+
+					unregVM ${NAM}	
+
+				    writeout "[$NAM] info: backup complete"
+				    writeout "[$NAM] info: finished doing a first copy in a diff scope, subsequent backups will be differential"				
+				    writeout "[$NAM] info: should you need to use the mirror VM, register it manually at the backup ESXi host" 
+				    drawline
+				else
+				    if [ "$DIFFBACKUPNUM" -gt "7" -a "$APPNAM" == "XSIBACKUP-FREE" ]
+				    then
+                    			up2Pro "[$NAM] info: more than 7 (c) OneDiff backup cycles"
+                                        xsib_shutdown
+				    fi
+				    # OneDiff Logic
+				    writeout "Initiating OneDiff differential backup..."
+				    drawline
+				    SNAPSHOTID=$( getSnapshotIdByName "xsibackuphot" "$VMSDFILEPATH" )
+				    # Delete any snapshot files in the destination
+				    if [ "$SERVERTYPE" = "NET" ]
+				    then
+				    	DELDELTA=$( ssh -o StrictHostKeyChecking=no -i "${PWD}"/xsibackup_id_rsa -p "$baksrvport" ${defremusr}@"$baksrvaddr" "find \""${backuppath// /\ }"/"${NAM// /\ }"\" -type f -regex '.*-[0-9]\{6\}.*' -exec rm {} \;" )
+				    	DELDELTA="$( echo "$DELDELTA" | sed '/FIPS mode initialized/d' )"
+				    else
+				   	DELDELTA=$( find "${backuppath}"/"${NAM}" -type f -regex '.*-[0-9]\{6\}.*' -exec rm {} \; ) 
+				    fi
+				    if [ "$DELDELTA" != "" ]
+				    then
+				    	writeout "\033[0;31m[$NAM] error DIFRMDEL: Could not delete snapshot delta remains at mirror VM [${NAM}_XSIBAK]\033[0m"
+				    	ERR DIFRMDEL "[$NAM] error: Could not delete snapshot delta remains at mirror VM [${NAM}_XSIBAK], details: $DELDELTA"
+				    else
+				    	writeout "[$NAM] info: delta remains cleaned up at mirror VM [${NAM}_XSIBAK]"
+				    fi
+				    drawline	
+				    # Copy all the snapshot files
+				    SNAPSHOTFILES=$( getSnapshotFilesById $SNAPSHOTID "$VMSDFILEPATH" )
+				    IFS=$newline
+				    for snapshotfile in $SNAPSHOTFILES
+				    do
+				        basesnapshotfile=$( basename "$snapshotfile" )
+					EXCLUDEDISK=0
+					if [ "$THEEXCLUSIONS" != "" ]
+					then
+					    IFS=';'
+					    for exclusion in $THEEXCLUSIONS
+					    do
+						snapshot2exclude=${exclusion//.vmdk/}
+						if [ "${basesnapshotfile//$snapshot2exclude/}" != "$basesnapshotfile" ]
+						then
+						    EXCLUDEDISK=1
+						    writeout "\033[0;36m[$NAM] info: disk [$basesnapshotfile] excluded\033[0m"
+						fi
+					    done
+					    IFS=$newline
+					fi
+				  	if [ "$EXCLUDEDISK" != "1" ]
+					then      
+				            remotepath="${backuppath}/${NAM}/${basesnapshotfile}"
+				            if [ ! -f "$snapshotfile" ]
+				            then
+				            	writeout "Missing snapshot file: $snapshotfile"
+				            else 
+				            	echo "[$NAM] info: transfering snapshot file [${basesnapshotfile}]"
+				            	exec 5>&1
+				            	if [ "$SERVERTYPE" = "NET" ]
+				            	then
+						    CPERRORS2=$( ("$PWD/bin/xsibackup-rsync" -rlpDv --progress --partial --whole-file --rsh="ssh -o StrictHostKeyChecking=no -i \"$PWD/xsibackup_id_rsa\" -p$baksrvport" --rsync-path="$RMRSYNCPATH" "$snapshotfile" ${defremusr}@"$baksrvaddr":"${remotepath// /\\ }" >&5) 2>&1 )
+				            	    CPERRORS2="$( echo "$CPERRORS2" | sed '/FIPS mode initialized/d' )"
+						else
+				                    #CPERRORS2=$( ("$PWD/bin/xsibackup-rsync" -rlpDv --progress --whole-file --sparse "$snapshotfile" "$remotepath" >&5) 2>&1 )
+                                                    CPERRORS2=$( ("$PWD/bin/xsidiff" --source="$snapshotfile" --target="$remotepath" --full >&5) 2>&1 )
+                                                fi
+                                            	exec 5>&-
+                                            fi
+                                            if [ "$CPERRORS2" != "" ]
+                                            then
+                                            	writeout "\033[0;31m[$NAM] CPERROR2 error: ${CPERRORS2}\033[0m"
+                                            	ERR CPERROR2 "[$NAM] error: ${CPERRORS2}"
+                                            fi
+                                            #drawline
+					else
+					    DEBUGINFO="${DEBUGINFO}<br />&bull;&nbsp;VM ${NAM} snapshot file excluded:&nbsp;${basesnapshotfile}"    	
+					fi
+				    drawline
+				    done
+				    IFS=$OLDIFS
+				    # Copy VMX and VMSD files as they were before the hot phase
+				    if [ "$XSIBAKDIFFVMX" != "" ]
+				    then
+				    	if [ "$debuginfo" == "yes" ]
+				    	then
+				    	    writeout "Synchronizing configuration files"
+				    	    drawline
+				    	    writeout "[$NAM] info: length of .vmx file before converting paths to absolute is ${#XSIBAKDIFFVMX}"
+				    	fi    
+				    	XSIBAKDIFFVMX=$( replaceAbsolutePaths "${XSIBAKDIFFVMX}" )
+				    	if [ "$debuginfo" == "yes" ]    
+				    	then    
+				    	    writeout "[$NAM] info: length of .vmx file after converting paths to absolute is ${#XSIBAKDIFFVMX}"
+				        fi
+				        if [ "$SERVERTYPE" = "NET" ]
+				        then
+				            # Copy .vmx file to tmp
+                                            TMPVMX="/tmp/$$_"$VMIDNU"_vmx_file_tmp"
+                                            echo "$XSIBAKDIFFVMX" > "$TMPVMX"
+                                            VMXCONTENT=$( cat "${TMPVMX}")
+                                            if [ "$debuginfo" == "yes" ]
+                                            then
+                                            	writeout "[$NAM] info: length of $TMPVMX file before replacing VM name is ${#VMXCONTENT}"
+                                            fi
+                                            # Replace name
+                                            REPLACENAME=$( sed -i "s/displayName = \"${NAM}\"/displayName = \"${NAM}_XSIBAK\"/g" "${TMPVMX}" )
+                                            # Remove -00000N
+                                            # SETOBASEVMDK=$( sed -ri 's/-[0-9]{6}.vmdk/.vmdk/g' "${TMPVMX}" )
+                                            VMXCONTENT=$( cat "${TMPVMX}")
+                                            if [ "$debuginfo" == "yes" ]
+                                            then
+                                            	writeout "[$NAM] info: length of $TMPVMX file after replacing VM name is ${#VMXCONTENT}"
+                                            fi
+                                            # Copy file to the other side
+                                            eval scp "$SSHOPTS" -P$baksrvport "${TMPVMX}" root@$baksrvaddr:\""${REMOTEVMXPATH// /\\ }"\"
+                                            # delete temp file
+                                            VMXCONTENT=$( cat "${TMPVMX}")
+                                            RMTMP=$( rm -rf "$TMPVMX" ) 	
+				        else	
+				    	    COPYVMX=$( echo "${XSIBAKDIFFVMX}" > "${REMOTEVMXPATH}" )
+				            VMXCONTENT=$( cat "${REMOTEVMXPATH}")
+				            writeout "[$NAM] info: length of remote .vmx file after copying it is ${#VMXCONTENT}"
+				            REPLACENAME=$( sed -i "s/displayName = \"${NAM}\"/displayName = \"${NAM}_XSIBAK\"/g" "${REMOTEVMXPATH}" )
+				    	    # Remove -00000N
+				    	    # SETOBASEVMDK=$( sed -ri 's/-[0-9]{6}.vmdk/.vmdk/g' "${TMPVMX}" )
+				    	    VMXCONTENT=$( cat "${REMOTEVMXPATH}")
+				    	    writeout "[$NAM] info: length of remote .vmx after replacing name is ${#VMXCONTENT}"
+				    	    writeout "[$NAM] info: name changed to [${NAM}_XSIBAK]"	
+				    	fi
+				    fi	
+                                    if [ "$XSIBAKDIFFVMSD" != "" ]
+                                    then
+					XSIBAKDIFFVMSD=$( replaceAbsolutePaths "${XSIBAKDIFFVMSD}" )
+                                       	if [ "$SERVERTYPE" = "NET" ]
+					then
+                                            # Copy .vmsd file to tmp
+                                            TMPVMSD="/tmp/$$_"$VMIDNU"_vmsd_file_tmp"
+                                            echo "$XSIBAKDIFFVMSD" > "$TMPVMSD"
+                                            # Copy file to the other side
+                                            eval scp "$SSHOPTS" -P$baksrvport "${TMPVMSD}" root@$baksrvaddr:\""${REMOTEVMSDPATH// /\\ }"\"
+                                            # delete temp file
+                                            RMTMP=$( rm -rf "$TMPVMSD" )
+					else 
+					    COPYVMSD=$( echo "${XSIBAKDIFFVMSD}" > "${REMOTEVMSDPATH}" )
+                                    	fi
+				    fi			
+				    drawline	
+				    writeout "Removing hot snapshot & merging data"
+				    drawline
+				    
+				    DELETEHOT=$( ( vim-cmd vmsvc/snapshot.remove $1 "$SNAPSHOTID" 0 ) 2>&1 )
+				    if [ "$( echo "$DELETEHOT" | grep xsibackupdiff | wc -l )" == "2" ]
+				    then
+					writeout "[$NAM] info: OneDiff backup differential data ($SNAPSHOTID) merged with base data"	
+				    else
+					writeout "\033[0;31m[$NAM] error DIFMERG1: cannot merge diff data back to VM, details: $DELETEHOT\033[0m"
+				    	ERR "DIFMERG1" "[$NAM] error: cannot merge diff data back to VM, details: $DELETEHOT"
+				    fi
+				    drawline
+				    
+				    # Delete excluded disks from .vmx file now, before trying to 
+				    # register the VM, reloading config or deleting snapshots
+                        	    if [ "$THEEXCLUSIONS" != "" ]
+                        	    then
+                        	    	IFS=';'
+                        	    	for exclusion in $THEEXCLUSIONS
+				    	do	
+                    			    # Remove disks
+                    			    exclstr=${exclusion//.vmdk/}
+					    deletewhat=$( echo "${VMXCONTENT}" | grep "$exclstr" | awk -F "." '{print $1}' | head -n1 )
+                        		    if [ "$deletewhat" != "" ]
+                        		    then
+                        		    	VMXCONTENT=$( echo "$VMXCONTENT" | sed "/$deletewhat/d")
+       					    fi
+                         	    	done
+                        	    	IFS=$OLDIFS
+                        	    	if [ "$SERVERTYPE" = "NET" ]
+                        	    	then
+                        	    	    COPYVMX=$( ( echo "$VMXCONTENT" | eval ssh "$SSHOPTS" -p"$baksrvport" ${defremusr}@"$baksrvaddr" "cat \> \"${REMOTEVMXPATH//\ /\\ }\"" ) 2>&1 )	
+                        	    	    COPYVMX="$( echo "$COPYVMX" | sed '/FIPS mode initialized/d' )"
+					    if [ "$COPYVMX" != "" ]
+                        	    	    then
+                        	    	    	writeout "\033[0;31m[$NAM] error DIFFEXUP: updating exclusions in .vmx file, details: $COPYVMX\033[0m"
+                        	    	    	ERR "DIFFEXUP" "[$NAM] error: updating exclusions in .vmx file, details: $COPYVMX"
+                        	    	    fi	
+                        	    	else
+                        	    	    echo "$VMXCONTENT" > "${REMOTEVMXPATH}"
+                        	    	fi
+                        	    	writeout "[$NAM] info: disk [$exclusion] excluded from the .vmx file"
+                        	    	DEBUGINFO="${DEBUGINFO}<br />&bull;&nbsp;[$NAM] info: disk [$exclusion] excluded from the .vmx file"
+                        	    fi
+				    
+				    # Now we check that the mirror VM exists, if not we 
+				    # create it and then delete the mirrored snapshot
+				    if [ "$REGISTERED" = "0" ]
+				    then			     
+                                        if [ "$SERVERTYPE" = "NET" ]
+                                        then
+                                            REGISTER=$( eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "vim-cmd /solo/register \"${REMOTEVMXPATH//\ /\\ }\" \"${NAM//\ /\\ }_XSIBAK\"" )
+                                            REGISTER="$( echo "$REGISTER" | sed '/FIPS mode initialized/d' )"
+					else
+                                            REGISTER=$( vim-cmd /solo/register "$REMOTEVMXPATH" "${NAM}_XSIBAK" )
+                                        fi					
+                                        if [ $( echo "$REGISTER" | grep -oE ^[0-9]+$ | wc -l ) != "" ]
+                                        then
+                                                REGISTERED="$REGISTER"
+                                                writeout "[$NAM] info: the backup mirror VM [${NAM}_XSIBAK] Id $REGISTERED has been created"
+                                        else
+                                                writeout "\033[0;31mCould not register the diff mirror VM [${NAM}_XSIBAK]\033[0m"
+                                        	ERR DIFFREG1 "[$NAM] error: could not register the diff mirror VM [${NAM}_XSIBAK], details: register output $REGISTER"
+                                        fi					    
+				    	drawline
+				    fi
+
+				    # Reload VM config
+				    if [ "$SERVERTYPE" = "NET" ]
+				    then
+					RELOAD=$( eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "vim-cmd vmsvc/reload "$REGISTERED )	
+				     	RELOAD="$( echo "$RELOAD" | sed '/FIPS mode initialized/d' )"
+				    else
+				    	RELOAD=$( vim-cmd vmsvc/reload "$REGISTERED" )
+				    fi
+				    if [ "$RELOAD" != "" ]
+				    then	
+				    	writeout "\033[0;31m[$NAM] error DIFFREL1: failed at reloading the diff mirror VM [${NAM}_XSIBAK]\033[0m"
+				    	ERR DIFFREL1 "[$NAM] error: failed at reloading VM [${NAM}_XSIBAK], details: reload output $RELOAD"
+				    else
+				    	writeout "[$NAM] info: diff mirror VM reloaded"
+				    fi
+				    drawline
+				    
+				    writeout "[$NAM] info: deleting snapshot at [${NAM}_XSIBAK] Id $REGISTERED..."
+				    # Now delete the mirrored snapshot
+				    if [ "$SERVERTYPE" = "NET" ]
+				    then
+					DELETESNAPSHOTS="$( eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "vim-cmd vmsvc/snapshot.removeall $REGISTERED 2>&1" )"	
+				    	DELETESNAPSHOTS="$( echo "$DELETESNAPSHOTS" | sed '/FIPS mode initialized/d' )"
+				    else
+				    	DELETESNAPSHOTS="$( vim-cmd vmsvc/snapshot.removeall "$REGISTERED" 2>&1 )"		    	
+				    fi
+				    if [ "$DELETESNAPSHOTS" != "Remove All Snapshots:" ]
+				    then
+					REINIT_ONEDIFF=1
+					writeout "\033[0;31m[$NAM] error DIFDELAL: error deleting all snapshots VM [${NAM}_XSIBAK] Id $REGISTERED, details: $DELETESNAPSHOTS\033[0m"
+				    	ERR DIFDELAL "[$NAM] error: error deleting all snapshots VM [${NAM}_XSIBAK] Id $REGISTERED, details: $DELETESNAPSHOTS"
+				    else
+				   	writeout "[$NAM] info: all snapshots removed" 
+				    fi	
+				    drawline
+				    
+				    if [ "${options//unreg-xsibak/}" != "${options}" ]
+				    then		
+					writeout "[$NAM] info: the _XSIBAK VM will now be unregistered to avoid duplicate MAC errors thrown by vCenter"
+	                                if [ "$SERVERTYPE" = "NET" ]
+	                                then
+	                                    UNREGISTER=$( eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "vim-cmd vmsvc/unregister "$REGISTERED )
+	                                    UNREGISTER="$( echo "$UNREGISTER" | sed '/FIPS mode initialized/d' )"
+					else
+	                                    UNREGISTER=$( vim-cmd vmsvc/unregister "$REGISTERED" )
+	                                fi
+				
+					if [ "$UNREGISTER" != "" ]
+					then
+					    writeout "\033[0;31m[$NAM] error DIFUNREG: could not unregister VM [${NAM}_XSIBAK], details: $UNREGISTER\033[0m"
+					    ERR DIFUNREG "[$NAM] error: could not unregister VM [${NAM}_XSIBAK], details: $UNREGISTER"
+					fi
+				    fi	
+		
+				    # And now update the remote vmdk file for the CIDs to be equal
+				    XSIBAKSYSVMDK=$( cat "$SYSTEMDISK1" )
+				    if [ "$SERVERTYPE" = "NET" ]
+				    then
+				    	writeout "[$NAM] info: Updating CID at [$baksrvaddr:$baksrvport:${SYSTEMDISK2}]"
+					COPYSYS1=$( ( echo "$XSIBAKSYSVMDK" | ssh -o StrictHostKeyChecking=no -i "${PWD}"/xsibackup_id_rsa -p"$baksrvport" ${defremusr}@"$baksrvaddr" "cat > "${SYSTEMDISK2// /\\ } ) 2>&1 )
+				    	COPYSYS1="$( echo "$COPYSYS1" | sed '/FIPS mode initialized/d' )"
+				    else
+				    	writeout "[$NAM] info: Updating CID at [${SYSTEMDISK2}]"
+					COPYSYS1=$( echo "${XSIBAKSYSVMDK}" > "${SYSTEMDISK2}" )
+				    fi
+				    if [ "$COPYSYS1" != "" ]
+				    then
+				    	REINIT_ONEDIFF=1
+					writeout "\033[0;31m[$NAM] error DIFUPCID: cannot update CID at VM [${NAM}_XSIBAK], details: $COPYSYS1\033[0m"
+				    	ERR DIFUPCID "[$NAM] error: cannot update CID at VM [${NAM}_XSIBAK], details: $COPYSYS1"
+				    else
+				    	writeout "[$NAM] info: finished OneDiff backup, CID updated"	
+				    fi	
+			
+				    drawline	
+				    REINIT_ONEDIFF=0
+				    missingdsk=0
+				    IFS=$newline
+				    for ldisk in $LOCALDISKS
+				    do		
+					if [ "${ldisk:0:1}" != "/" ]
+                                        then
+                                            labspath="$VMXFILEDIRE"/"$ldisk"
+					    lfname="$ldisk"	
+                                        else
+                                            labspath="$ldisk"
+					    lfname="$( basename "$ldisk" )"
+                                        fi
+					local_vmdk_descriptor="${lfname/-flat.vmdk/.vmdk}"
+					if [ "${THEEXCLUSIONS//$local_vmdk_descriptor/}" == "$THEEXCLUSIONS" ]
+					then					
+					    remotefound=0
+					    IFS=$newline
+					    for rdsk in $REMOTEDISKS
+					    do				    
+					    	if [ "$lfname" == "$rdsk" ]
+					    	then
+						    remotefound=1
+						fi        
+					    done
+					    if [ "$remotefound" -eq "0" ]
+					    then
+					    	REINIT_ONEDIFF=1
+						writeout "\033[0;31m[$NAM] error DIFRMIS2: cannot find disk [$lfname] in remote OneDiff mirror\033[0m"	
+					    	ERR DIFRMIS2 "[$NAM] error: cannot find disk [$lfname] in remote OneDiff mirror"	
+					    else
+                                                if [ "$SERVERTYPE" = "NET" ]
+                                                then
+                                                    VMDKLOCATIO="$baksrvaddr":"$baksrvport":"${REMOTEVMXDIR}"/"$lfname"
+                                                else
+                                                    VMDKLOCATIO="${REMOTEVMXDIR}"/"$lfname"
+                                                fi
+					   	if [ -f "$PWD"/src/pro/onediff -a "$APPNAM" == "XSIBACKUP-PRO" ]
+					   	then 
+						    . "$PWD"/src/pro/onediff		
+						else
+						    certifybackup=no
+						    VMCERTIFIED=2
+						    up2Pro "Backup Certification and Trivial Check"
+						fi
+					    fi
+					fi
+				    done
+				    IFS=$OLDIFS	
+				    # If something went wrong we reinitialize the OneDiff mirror	
+                                    # Delete remote .vmx file to reinitialize OneDiff
+                                    if [ "$REINIT_ONEDIFF" -eq "1" ]
+				    then	
+					if [ "$SERVERTYPE" = "NET" ]
+                                    	then
+                                            DELREMVMX=$( eval ssh "$SSHOPTS" -p "$baksrvport" ${defremusr}@"$baksrvaddr" "mv \"${REMOTEVMXPATH//\ /\\ }\" \"${REMOTEVMXPATH//\ /\\ }.bak\" 2>&1" )
+                                    	    DELREMVMX="$( echo "$DELREMVMX" | sed '/FIPS mode initialized/d' )"
+					else
+                                            DELREMVMX=$( mv "${REMOTEVMXPATH}" "${REMOTEVMXPATH}.bak" 2>&1 )
+                                    	fi
+                                    	if [ "$DELREMVMX" != "" ]
+                                    	then
+                                            writeout "\033[0;31m[$NAM] error DIFRMVMX: tried to take measure, but could not rename remote .vmx file, \
+					    delete remote [$NAM_XSIBAK] VMX file, details: $DELREMVMX\033[0m"
+                                            ERR DIFRMVMX "[$NAM] error: tried to take measure, but could not rename remote .vmx file, delete remote [$NAM_XSIBAK] VMX file, details: $DELREMVMX"
+                                    	else
+                                            writeout "\033[0;36m[$NAM] measure DIFRMVMX: took measure, renamed remote .vmx file to reinitialize OneDiff\033[0m"
+                                            ERR DIFRMVMX "[$NAM] measure DIFRMVMX: took measure, renamed remote .vmx file to reinitialize OneDiff" W
+                                    	fi
+				    fi		
+				
+				fi
+                #fi
+	
+
+	else
+                writeout "\033[0;31m[$NAM] error DIFVMSD2: Could not find the .VMSD file at $VMXDir\033[0m"
+                ERR DIFVMSD2 "[$NAM] error: could not find the .VMSD file at $VMXDir"
+        fi
+fi
+
+}

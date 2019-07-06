@@ -1,0 +1,19 @@
+#!/bin/sh
+OLDIFS=$IFS
+newline=$'\012'
+IFS=${newline}
+PWD="$( cd "$( dirname "$0" )" && pwd )"
+if [ -f "$PWD"/functions ]
+then
+    . "$PWD"/functions
+else
+    echo "ERROR: can't find functions file at conf/functions"
+fi
+if [ -f "$PWD"/xsitools ]
+then
+    . "$PWD"/xsitools
+else
+    echo "ERROR: can't find functions file at conf/functions"
+fi
+
+"$1" "$2" "$3" "$4" "$5"

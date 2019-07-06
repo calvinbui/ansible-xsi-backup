@@ -1,0 +1,41 @@
+#!/bin/sh
+PWD="$( cd "$( dirname "$0" )" && cd .. && pwd )"
+TW=$( stty size | cut -d ' ' -f 2 )
+separator="-"
+separator="\e[90m${separator}\033[0m"
+if [ -f "$PWD/src/functions" ]
+then
+    . "$PWD/src/functions"
+fi
+
+if [ "$1" == "" ]
+then
+    cronuser="root"
+else
+    cronuser="$1"
+fi
+if [ ! -f "$PWD"/conf/${cronuser}-crontab ]
+then
+    touch "$PWD"/conf/${cronuser}-crontab	
+fi
+ADDCRON="$( cat "$PWD"/conf/${cronuser}-crontab | grep -v "^#" | sed '/^$/d' | sed 's/$/ # Added by XSIBackup/' )"
+if [ "${#ADDCRON}" -gt "0" ]
+then
+    sed -i '/Added by XSIBackup/d' /var/spool/cron/crontabs/${cronuser}
+    echo "$ADDCRON" >> /var/spool/cron/crontabs/${cronuser}
+    if [ "$?" -eq "0" ]
+    then
+    	echo -e "The \e[1m${cronuser}\033[0m user crontab has been succesfully updated"
+    	drawline
+    	echo -e "This is the current content of the \e[1m${cronuser}\033[0m crontab"
+    	drawline
+    	CRONTAB="$( cat /var/spool/cron/crontabs/${cronuser} )"
+    	echo "${CRONTAB}"
+    else
+    	echo -e "An error has occurred while trying to update the \e[1m${cronuser}\033[0m user crontab"
+    fi
+else
+    echo "Nothing to add to the ${cronuser} crontab"
+fi
+drawline
+crond_reinit
