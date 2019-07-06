@@ -50,6 +50,13 @@
     mode: 0700
   loop: "{{ xsibackup_jobs|flatten(levels=1) }}"
 
+- name: Touch XSIBackup crontab
+  file:
+    path: "{{ xsibackup_working_dir }}/xsibackup/conf/root-crontab"
+    state: touch
+    modification_time: preserve
+    access_time: preserve
+
 - name: Add jobs to XSIBackup crontab
   lineinfile:
     path: "{{ xsibackup_working_dir }}/xsibackup/conf/root-crontab"
