@@ -8,6 +8,7 @@
     - "{{ xsibackup_working_dir }}"
     - "{{ xsibackup_working_dir }}/xsibackup"
     - "{{ xsibackup_working_dir }}/xsibackup-{{ xsibackup_version }}"
+    - "{{ xsibackup_working_dir }}/xsibackup-{{ xsibackup_version }}/jobs"
     - "{{ xsibackup_backup_dir }}"
 
 - name: Copy XSIBackup {{ xsibackup_version }} folder
